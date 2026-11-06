@@ -12,7 +12,10 @@ def _worker():
     worker = object.__new__(bw.NixlBaseConnectorWorker)
     worker.use_mla = False
     worker.kv_cache_layout = "HND"
-    worker.kv_transfer_config = SimpleNamespace(enable_permute_local_kv=False)
+    worker.kv_transfer_config = SimpleNamespace(
+        enable_permute_local_kv=False,
+        get_from_extra_config=lambda key, default: default,
+    )
     return worker
 
 

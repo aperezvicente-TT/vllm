@@ -6,6 +6,7 @@ import contextlib
 import itertools
 import logging
 import math
+import mmap
 import os
 import queue
 import threading
@@ -59,6 +60,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
+    alloc_hugepage_host_buffers,
     get_representative_spec_type,
     zmq_ctx,
 )
@@ -722,6 +724,8 @@ class NixlBaseConnectorWorker:
         # cpu kv buffer for xfer
         # used when device memory can not be registered under nixl
         self.host_xfer_buffers: dict[str, torch.Tensor] = {}
+        # Hugetlb mapping backing host_xfer_buffers, if any; outlives the tensors.
+        self._host_buffer_mapping: mmap.mmap | None = None
         if self.device_type == "cpu":
             self.use_host_buffer = False
         else:
@@ -1217,7 +1221,23 @@ class NixlBaseConnectorWorker:
                 shapes[layer_name] = (tuple(kv_shape), kv_dtype)
                 if permute_shape:
                     permuted.add(layer_name)
-            xfer_buffers = current_platform.alloc_kv_host_buffers(shapes) or {}
+            hugepage_size = self.kv_transfer_config.get_from_extra_config(
+                "host_buffer_hugepage_size", None
+            )
+            if hugepage_size is not None:
+                try:
+                    self._host_buffer_mapping, xfer_buffers = (
+                        alloc_hugepage_host_buffers(shapes, hugepage_size)
+                    )
+                except OSError as e:
+                    logger.warning(
+                        "Host transfer buffers not allocated from %s hugepages "
+                        "(%s); using the platform's or regular memory.",
+                        hugepage_size,
+                        e,
+                    )
+            if not xfer_buffers:
+                xfer_buffers = current_platform.alloc_kv_host_buffers(shapes) or {}
             for layer_name, (shape, dtype) in shapes.items():
                 if layer_name not in xfer_buffers:
                     xfer_buffers[layer_name] = torch.empty(

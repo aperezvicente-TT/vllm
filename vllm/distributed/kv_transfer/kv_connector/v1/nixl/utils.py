@@ -3,10 +3,13 @@
 """Shared constants, lazy imports and helpers for the NIXL connector."""
 
 import contextlib
+import math
+import mmap
 from collections.abc import Iterator
 from typing import Any
 
 import regex as re
+import torch
 import zmq
 
 from vllm.platforms import current_platform
@@ -65,3 +68,53 @@ _RANDOM_SUFFIX_RE = re.compile(r"-[0-9a-f]{8}$", re.IGNORECASE)
 def get_base_request_id(request_id: str) -> str:
     """Strip the per-request ``-<8 hex>`` randomization suffix, if present."""
     return _RANDOM_SUFFIX_RE.sub("", request_id)
+
+
+_HUGEPAGE_SIZES = {"2M": 2 << 20, "1G": 1 << 30}
+_MAP_HUGETLB = 0x40000  # Linux; not exported by the mmap module before Python 3.13
+_MAP_HUGE_SHIFT = 26
+
+
+def alloc_hugepage_host_buffers(
+    shapes: dict[str, tuple[tuple[int, ...], torch.dtype]], page_size: str
+) -> tuple[mmap.mmap, dict[str, torch.Tensor]]:
+    """Allocate host transfer buffers from one anonymous hugetlb mapping.
+
+    Buffers are laid out in order, and one that fits in a huge page never spans two, so
+    it is physically contiguous. Devices that DMA into host memory without an IOMMU
+    translating for them (passthrough) can only map physically contiguous memory, and a
+    NIC registers it with one translation entry per huge page.
+
+    Returns the mapping, which must outlive the tensors, and the tensors by name.
+    Raises OSError when the hugetlb pool cannot back the mapping.
+    """
+    if page_size not in _HUGEPAGE_SIZES:
+        raise ValueError(
+            f"host_buffer_hugepage_size must be one of {list(_HUGEPAGE_SIZES)}, "
+            f"got {page_size!r}"
+        )
+    page = _HUGEPAGE_SIZES[page_size]
+    offsets: dict[str, tuple[int, int]] = {}
+    end = 0
+    for name, (shape, dtype) in shapes.items():
+        nbytes = math.prod(shape) * dtype.itemsize
+        end = -(-end // 4096) * 4096
+        if nbytes <= page and end // page != (end + nbytes - 1) // page:
+            end = -(-end // page) * page
+        offsets[name] = (end, nbytes)
+        end += nbytes
+    total = max(page, -(-end // page) * page)
+    flags = mmap.MAP_PRIVATE | _MAP_HUGETLB | (page.bit_length() - 1) << _MAP_HUGE_SHIFT
+    try:
+        buf = mmap.mmap(-1, total, flags=flags, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+    except OSError as e:
+        raise OSError(
+            e.errno, f"{e.strerror}: {total // page} pages of {page_size} requested"
+        ) from e
+    tensors = {
+        name: torch.frombuffer(buf, dtype=torch.uint8, count=nbytes, offset=off)
+        .view(shapes[name][1])
+        .view(shapes[name][0])
+        for name, (off, nbytes) in offsets.items()
+    }
+    return buf, tensors
