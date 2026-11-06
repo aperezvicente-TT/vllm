@@ -6,6 +6,7 @@ import contextlib
 import itertools
 import logging
 import math
+import mmap
 import os
 import queue
 import threading
@@ -60,6 +61,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
+    alloc_hugepage_host_buffers,
     get_representative_spec_type,
     zmq_ctx,
 )
@@ -878,6 +880,8 @@ class NixlBaseConnectorWorker:
         # cpu kv buffer for xfer
         # used when device memory can not be registered under nixl
         self.host_xfer_buffers: dict[str, torch.Tensor] = {}
+        # Hugetlb mapping backing host_xfer_buffers, if any; outlives the tensors.
+        self._host_buffer_mapping: mmap.mmap | None = None
         if self.device_type == "cpu":
             self.use_host_buffer = False
         else:
@@ -1353,12 +1357,14 @@ class NixlBaseConnectorWorker:
         NOT directly supported by NIXL (e.g., tpu)
         """
         xfer_buffers: dict[str, torch.Tensor] = {}
+        shapes: dict[str, tuple[tuple[int, ...], torch.dtype]] = {}
+        permuted: set[str] = set()
+        inv_order = (0, 2, 1, 3)
         try:
             for layer_name, kv_cache in kv_caches.items():
                 kv_shape = kv_cache.shape
                 kv_dtype = kv_cache.dtype
                 permute_shape = False
-                inv_order = (0, 2, 1, 3)
                 if not self.use_mla:
                     assert kv_cache.ndim == 4
 
@@ -1379,10 +1385,31 @@ class NixlBaseConnectorWorker:
                             kv_shape = tuple(kv_shape[i] for i in inv_order)
                             permute_shape = True
 
-                xfer_buffers[layer_name] = torch.empty(
-                    kv_shape, dtype=kv_dtype, device="cpu"
-                )
+                shapes[layer_name] = (tuple(kv_shape), kv_dtype)
                 if permute_shape:
+                    permuted.add(layer_name)
+
+            hugepage_size = self.kv_transfer_config.get_from_extra_config(
+                "host_buffer_hugepage_size", None
+            )
+            if hugepage_size is not None:
+                try:
+                    self._host_buffer_mapping, xfer_buffers = (
+                        alloc_hugepage_host_buffers(shapes, hugepage_size)
+                    )
+                except OSError as e:
+                    logger.warning(
+                        "Host transfer buffers not allocated from %s hugepages "
+                        "(%s); using regular memory.",
+                        hugepage_size,
+                        e,
+                    )
+            for layer_name, (shape, dtype) in shapes.items():
+                if layer_name not in xfer_buffers:
+                    xfer_buffers[layer_name] = torch.empty(
+                        shape, dtype=dtype, device="cpu"
+                    )
+                if layer_name in permuted:
                     xfer_buffers[layer_name] = xfer_buffers[layer_name].permute(
                         inv_order
                     )

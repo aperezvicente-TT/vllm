@@ -90,6 +90,10 @@ mknod /dev/nvidia-caps-imex-channels/channel0 c "$major" 0
 
 Check the transport with `UCX_PROTO_INFO=y`: KV reads should show `cuda_ipc`, not `tcp`. Transfers across hosts use RDMA and need no channel: pass `--enable-extensible-kv-cache` to keep the feature on.
 
+#### Hugepage host buffers
+
+With `"kv_buffer_device": "cpu"`, `kv_connector_extra_config.host_buffer_hugepage_size` (`"2M"` or `"1G"`) allocates the host transfer buffers from the hugetlb pool instead of regular memory. Buffers are packed so that no KV block spans two huge pages, so each block is physically contiguous: devices that DMA into host memory with their IOMMU in passthrough can map it, and the NIC registers the buffers with one translation entry per huge page. Reserve enough pages first (`/sys/kernel/mm/hugepages/hugepages-<size>kB/nr_hugepages`); if the pool is too small, the connector logs a warning and uses regular memory.
+
 ## Basic Usage (on the same host)
 
 ### Producer (Prefiller) Configuration
