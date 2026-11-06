@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Metadata dataclasses and helpers for the NIXL connector."""
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -128,7 +129,7 @@ def _get_speculative_compatibility_factors(
     # catching anything the runtime layout check misses.
     return {
         "method": speculative_config.method,
-        "model": draft_model_config.model,
+        "model": _model_identity(draft_model_config.model),
         "revision": draft_model_config.revision,
         "code_revision": draft_model_config.code_revision,
         "parallel_drafting": speculative_config.parallel_drafting,
@@ -137,6 +138,24 @@ def _get_speculative_compatibility_factors(
             tuple(auxiliary_layer_ids) if auxiliary_layer_ids is not None else None
         ),
     }
+
+
+def _model_identity(model: str) -> str:
+    """The model as the compatibility hash sees it, independent of where it is stored.
+
+    With HF_HUB_OFFLINE, the engine replaces a repo id with its local snapshot path
+    (``<cache>/models--<org>--<name>/snapshots/<revision>``); two instances serving
+    the same repo from different cache directories must still hash alike, and like
+    an online instance that kept the repo id. Other models are returned unchanged.
+    """
+    parts = os.path.normpath(model).split(os.sep)
+    if (
+        len(parts) >= 3
+        and parts[-2] == "snapshots"
+        and parts[-3].startswith("models--")
+    ):
+        return parts[-3][len("models--") :].replace("--", "/")
+    return model
 
 
 def compute_nixl_compatibility_hash(
@@ -184,7 +203,7 @@ def compute_nixl_compatibility_hash(
         "vllm_version": vllm_version,
         "nixl_connector_version": NIXL_CONNECTOR_VERSION,
         # Model architecture - affects KV cache shape
-        "model": model_config.model,
+        "model": _model_identity(model_config.model),
         "dtype": str(model_config.dtype),
         "num_kv_heads": model_config.get_total_num_kv_heads(),
         "head_size": model_config.get_head_size(),
