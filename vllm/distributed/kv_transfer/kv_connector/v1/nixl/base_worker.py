@@ -1353,12 +1353,14 @@ class NixlBaseConnectorWorker:
         NOT directly supported by NIXL (e.g., tpu)
         """
         xfer_buffers: dict[str, torch.Tensor] = {}
+        shapes: dict[str, tuple[tuple[int, ...], torch.dtype]] = {}
+        permuted: set[str] = set()
+        inv_order = (0, 2, 1, 3)
         try:
             for layer_name, kv_cache in kv_caches.items():
                 kv_shape = kv_cache.shape
                 kv_dtype = kv_cache.dtype
                 permute_shape = False
-                inv_order = (0, 2, 1, 3)
                 if not self.use_mla:
                     assert kv_cache.ndim == 4
 
@@ -1379,10 +1381,16 @@ class NixlBaseConnectorWorker:
                             kv_shape = tuple(kv_shape[i] for i in inv_order)
                             permute_shape = True
 
-                xfer_buffers[layer_name] = torch.empty(
-                    kv_shape, dtype=kv_dtype, device="cpu"
-                )
+                shapes[layer_name] = (tuple(kv_shape), kv_dtype)
                 if permute_shape:
+                    permuted.add(layer_name)
+            xfer_buffers = current_platform.alloc_kv_host_buffers(shapes) or {}
+            for layer_name, (shape, dtype) in shapes.items():
+                if layer_name not in xfer_buffers:
+                    xfer_buffers[layer_name] = torch.empty(
+                        shape, dtype=dtype, device="cpu"
+                    )
+                if layer_name in permuted:
                     xfer_buffers[layer_name] = xfer_buffers[layer_name].permute(
                         inv_order
                     )

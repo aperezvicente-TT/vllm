@@ -1472,6 +1472,15 @@ class Platform:
         return None
 
     @classmethod
+    def alloc_kv_host_buffers(
+        cls, shapes: dict[str, tuple[tuple[int, ...], torch.dtype]]
+    ) -> dict[str, torch.Tensor] | None:
+        """Allocate the KV connector's host transfer buffers, one per layer, for
+        a platform whose devices need particular host memory to DMA into (e.g.
+        physically contiguous). None: regular CPU memory."""
+        return None
+
+    @classmethod
     def check_max_model_len(cls, max_model_len: int) -> int:
         """Check max_model_len for the current platform."""
         return max_model_len
