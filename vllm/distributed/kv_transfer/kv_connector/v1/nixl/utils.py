@@ -80,10 +80,12 @@ def alloc_hugepage_host_buffers(
 ) -> tuple[mmap.mmap, dict[str, torch.Tensor]]:
     """Allocate host transfer buffers from one anonymous hugetlb mapping.
 
-    Buffers are laid out in order, and one that fits in a huge page never spans two, so
-    it is physically contiguous. Devices that DMA into host memory without an IOMMU
-    translating for them (passthrough) can only map physically contiguous memory, and a
-    NIC registers it with one translation entry per huge page.
+    Buffers are laid out in order. One whose rows (first-dimension entries, the KV
+    blocks) evenly divide the huge page follows the previous one, aligned so that no
+    row spans two pages; any other buffer that fits in a huge page never spans two.
+    Either way each row is physically contiguous: devices that DMA into host memory
+    without an IOMMU translating for them (passthrough) can only map physically
+    contiguous memory. A NIC registers the mapping with one entry per huge page.
 
     Returns the mapping, which must outlive the tensors, and the tensors by name.
     Raises OSError when the hugetlb pool cannot back the mapping.
@@ -98,9 +100,13 @@ def alloc_hugepage_host_buffers(
     end = 0
     for name, (shape, dtype) in shapes.items():
         nbytes = math.prod(shape) * dtype.itemsize
-        end = -(-end // 4096) * 4096
-        if nbytes <= page and end // page != (end + nbytes - 1) // page:
-            end = -(-end // page) * page
+        row = nbytes // shape[0] if shape and shape[0] else nbytes
+        if 0 < row <= page and page % row == 0:
+            end = -(-end // max(row, 4096)) * max(row, 4096)
+        else:
+            end = -(-end // 4096) * 4096
+            if nbytes <= page and end // page != (end + nbytes - 1) // page:
+                end = -(-end // page) * page
         offsets[name] = (end, nbytes)
         end += nbytes
     total = max(page, -(-end // page) * page)

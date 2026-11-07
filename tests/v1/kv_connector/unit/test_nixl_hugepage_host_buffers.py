@@ -22,20 +22,39 @@ def regular_mmap(monkeypatch):
     return calls
 
 
-def test_buffers_fitting_a_page_never_span_two(regular_mmap):
-    page = 2 << 20
-    shapes = {f"l{i}": ((3, 128, 1024), torch.bfloat16) for i in range(5)}  # 768 KiB
-    buf, tensors = utils.alloc_hugepage_host_buffers(shapes, "2M")
+def _page_spans(buf, t, page):
     base = torch.frombuffer(buf, dtype=torch.uint8).data_ptr()
+    start = t.data_ptr() - base
+    return start, start + t.numel() * t.element_size() - 1
+
+
+def test_rows_dividing_the_page_are_packed_without_spanning_pages(regular_mmap):
+    page = 2 << 20
+    # 768 KiB buffers of three 256 KiB rows: packed back to back, so five fill two
+    # pages, and a buffer may span pages but none of its rows does.
+    shapes = {f"l{i}": ((3, 128, 1024), torch.bfloat16) for i in range(5)}
+    buf, tensors = utils.alloc_hugepage_host_buffers(shapes, "2M")
+    row = 256 << 10
     for t in tensors.values():
-        start = t.data_ptr() - base
-        end = start + t.numel() * t.element_size() - 1
+        start, _ = _page_spans(buf, t, page)
+        assert start % row == 0
+        for r in range(3):
+            a = start + r * row
+            assert a // page == (a + row - 1) // page
+    assert regular_mmap == [
+        (2 * page, mmap.MAP_PRIVATE | utils._MAP_HUGETLB | 21 << utils._MAP_HUGE_SHIFT)
+    ]
+
+
+def test_buffers_with_other_rows_that_fit_a_page_never_span_two(regular_mmap):
+    page = 2 << 20
+    shapes = {f"l{i}": ((3, 250_000), torch.uint8) for i in range(5)}  # 750 kB
+    buf, tensors = utils.alloc_hugepage_host_buffers(shapes, "2M")
+    for t in tensors.values():
+        start, end = _page_spans(buf, t, page)
         assert start // page == end // page
         assert start % 4096 == 0
-    # Two buffers per 2 MiB page: three pages.
-    assert regular_mmap == [
-        (3 * page, mmap.MAP_PRIVATE | utils._MAP_HUGETLB | 21 << utils._MAP_HUGE_SHIFT)
-    ]
+    assert regular_mmap[0][0] == 3 * page  # two per page
 
 
 def test_buffers_have_requested_shape_and_dtype_and_are_disjoint(regular_mmap):
