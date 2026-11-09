@@ -2749,12 +2749,16 @@ class NixlBaseConnectorWorker:
                 ",".join(map(str, local_block_ids)),
             )
 
-    def save_kv_to_host(self, metadata: NixlConnectorMetadata):
-        """Copy kv from device to host buffer."""
+    def save_kv_to_host(self, metadata: NixlConnectorMetadata) -> dict[ReqId, list]:
+        """Copy kv from device to host buffer.
+
+        Returns the handles an asynchronous copy op gave for each request's
+        copies (see ``CopyBlocksOp``); a synchronous op's copies are done here.
+        """
         assert self.use_host_buffer
         assert self.copy_blocks is not None
 
-        # The d2h block copies below are intentionally synchronous.
+        handles: dict[ReqId, list] = {}
         with gpu_sync_allowed():
             for req_id, meta in metadata.reqs_to_save.items():
                 meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
@@ -2767,15 +2771,17 @@ class NixlBaseConnectorWorker:
                         req_id,
                         ",".join(map(str, meta.local_physical_block_ids)),
                     )
-                # blocking
                 for group_block_ids in meta.local_physical_block_ids:
-                    self.copy_blocks(
+                    handle = self.copy_blocks(
                         self.device_kv_caches,
                         self.host_xfer_buffers,
                         group_block_ids,
                         group_block_ids,
                         "d2h",
                     )
+                    if handle is not None:
+                        handles.setdefault(req_id, []).append(handle)
+        return handles
 
     @cached_property
     def _attention_kv_caches(self) -> list[torch.Tensor]:

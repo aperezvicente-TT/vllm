@@ -40,6 +40,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PUSH_ABORT_NOTIF_PREFIX,
+    PUSH_PART_NOTIF_PREFIX,
     PUSH_REG_NOTIF_PREFIX,
     NixlAgentMetadata,
     NixlConnectorMetadata,
@@ -293,7 +295,7 @@ class TestPushScheduler:
 
     def test_registration_watchdog_expires(self, caplog):
         """Stale D registrations whose deadline has passed are dropped at
-        ``build_connector_meta`` time."""
+        ``build_connector_meta`` time, and their receive is failed."""
         # Watchdog logs a WARNING when it drops the stale entry; that's
         # what this test is verifying, so silence it in the test report.
         caplog.set_level(
@@ -325,6 +327,8 @@ class TestPushScheduler:
         assert d_req.request_id not in sched._push_registration_deadlines
         assert d_req.request_id not in sched._push_pending_registrations
         assert d_req.request_id not in meta.push_registrations
+        assert meta.push_expired_recvs == {d_req.request_id}
+        assert not sched._push_expired_recvs
 
 
 # ----------------------------------------------------------------- #
@@ -356,6 +360,15 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._pending_completion_notifs = queue.Queue()
         w._evict_finished_inbox = queue.Queue()
         w._deferred_push_inbox = queue.Queue()
+        w._early_saves = {}
+        w._early_blocks_inbox = queue.Queue()
+        w._early_abort_inbox = queue.Queue()
+        w._early_pushes = {}
+        w._aborted_reqs = {}
+        w._aborted_req_ttl = 30.0
+        w._push_parts_loaded = {}
+        w.use_host_buffer = False
+        w.copy_blocks = None
         w._push_writer_wake = threading.Event()
         w._push_writer_stop = threading.Event()
         w._push_writer_thread = None
@@ -2156,3 +2169,481 @@ def test_layer_handshake_rejects_unsupported_geometry(
     assert not worker.kv_caches_base_addr
     with pytest.raises(KeyError):
         worker.transfer_topo.get_engine_info(metadata.engine_id)
+
+
+# ----------------------------------------------------------------- #
+#  Early push: P WRITEs final blocks while the request prefills     #
+# ----------------------------------------------------------------- #
+
+_P_ENGINE = "decode-engine"
+
+
+def _save_step_output(new_reqs, cached, num_scheduled):
+    """SchedulerOutput stand-in for ``_build_save_meta``: *new_reqs* is
+    [(req_id, block_ids)], *cached* is [(req_id, new_block_ids, resumed)]."""
+    out = MagicMock()
+    out.scheduled_new_reqs = [
+        MagicMock(req_id=rid, block_ids=blocks) for rid, blocks in new_reqs
+    ]
+    out.scheduled_cached_reqs = MagicMock(
+        req_ids=[c[0] for c in cached],
+        new_block_ids=[c[1] for c in cached],
+        resumed_req_ids={c[0] for c in cached if c[2]},
+    )
+    out.num_scheduled_tokens = num_scheduled
+    return out
+
+
+def _p_save_request(request_id: str, num_prompt_tokens: int) -> MagicMock:
+    req = _make_request(request_id=request_id, is_d_side=False, finished=False)
+    req.num_prompt_tokens = num_prompt_tokens
+    req.num_computed_tokens = 0
+    return req
+
+
+class TestEarlyPushScheduler:
+    def test_partial_steps_report_final_blocks(self):
+        """Block size 16, a 72-token prompt in chunks of 32 + 40: the first
+        save reports 2 final blocks of 5, the last save completes the prompt."""
+        sched = make_nixl_push_scheduler(early_push=True)
+        _stub_sw_clipping(sched)
+        req = _p_save_request("req-p", 72)
+        sched._reqs_need_save[req.request_id] = req
+
+        meta = NixlConnectorMetadata()
+        sched._build_save_meta(
+            meta, _save_step_output([("req-p", ([1, 2],))], [], {"req-p": 32})
+        )
+        rm = meta.reqs_to_save["req-p"]
+        assert (rm.push_total_blocks, rm.push_final_blocks) == (5, 2)
+        assert not rm.push_last_save
+
+        req.num_computed_tokens = 32
+        meta = NixlConnectorMetadata()
+        sched._build_save_meta(
+            meta,
+            _save_step_output([], [("req-p", ([3, 4, 5],), False)], {"req-p": 40}),
+        )
+        rm = meta.reqs_to_save["req-p"]
+        assert (rm.push_total_blocks, rm.push_final_blocks) == (5, 4)
+        assert rm.push_last_save
+        assert "req-p" not in sched._reqs_need_save
+
+    def test_resumed_request_is_not_pushed_early(self):
+        """A preempted request's blocks are rebuilt; it stays off early push."""
+        sched = make_nixl_push_scheduler(early_push=True)
+        _stub_sw_clipping(sched)
+        req = _p_save_request("req-p", 96)
+        req.num_computed_tokens = 32
+        sched._reqs_need_save[req.request_id] = req
+        meta = NixlConnectorMetadata()
+        sched._build_save_meta(
+            meta,
+            _save_step_output([], [("req-p", ([7, 8],), True)], {"req-p": 32}),
+        )
+        assert meta.reqs_to_save["req-p"].push_total_blocks == 0
+        assert "req-p" in sched._early_push_off
+
+    def test_disabled_reports_nothing(self):
+        sched = make_nixl_push_scheduler()
+        sched.use_host_buffer = True
+        _stub_sw_clipping(sched)
+        req = _p_save_request("req-p", 72)
+        sched._reqs_need_save[req.request_id] = req
+        meta = NixlConnectorMetadata()
+        sched._build_save_meta(
+            meta, _save_step_output([("req-p", ([1, 2],))], [], {"req-p": 32})
+        )
+        assert meta.reqs_to_save["req-p"].push_total_blocks == 0
+
+
+class _Handle:
+    def __init__(self, done: bool = False, error: Exception | None = None):
+        self._done, self.error = done, error
+
+    def done(self) -> bool:
+        if self.error is not None:
+            raise self.error
+        return self._done
+
+
+class _EarlyWorker(_StubWriterWorker):
+    """Stub worker that runs the real early push and final push code, with a
+    fake NIXL agent recording WRITEs and one D engine of equal geometry."""
+
+    _do_start_push_kv = NixlPushConnectorWorker._do_start_push_kv
+
+    @classmethod
+    def make(cls, *, remote_tp: int = 1, remote_block_size: int = 16) -> _EarlyWorker:
+        w = cls.fresh()
+        w.block_size = 16
+        w.world_size = 1
+        w.use_host_buffer = True
+        w._log_failure = MagicMock()  # type: ignore[method-assign]
+        w.xfer_stats = MagicMock()
+        w._logical_to_kernel_block_ids = lambda ids, ratio: ids
+        w._ensure_handshake = lambda *a, **k: None
+        w.transfer_topo = MagicMock()
+        w.transfer_topo.get_engine_info.return_value = MagicMock(
+            remote_tp_size=remote_tp,
+            remote_block_size=remote_block_size,
+            remote_physical_blocks_per_logical=1,
+        )
+        w.tp_mappings = {_P_ENGINE: MagicMock(all_source_ranks=(0,))}
+        w.dst_region_group_ids = {_P_ENGINE: [0]}
+        w.src_xfer_handles_by_block_size = {remote_block_size: "local-side"}
+        w.dst_xfer_side_handles = {_P_ENGINE: {0: "remote-side"}}
+        w._write_desc_ids = lambda local, remote, engine, ratio: (
+            list(local[0]),
+            list(remote[0]),
+        )
+        w.nixl_wrapper = MagicMock()
+        w.writes: list[tuple[list[int], list[int], bytes]] = []
+        w.xfer_state: dict[int, str] = {}
+
+        def make_prepped_xfer(op, lh, ldesc, rh, rdesc, notif_msg=b""):
+            assert op == "WRITE"
+            w.writes.append((ldesc, rdesc, notif_msg))
+            handle = 1000 + len(w.writes)
+            w.xfer_state[handle] = "PROC"
+            return handle
+
+        w.nixl_wrapper.make_prepped_xfer.side_effect = make_prepped_xfer
+        w.nixl_wrapper.check_xfer_state.side_effect = lambda h: w.xfer_state[h]
+        w.final_pushes: list[Any] = []
+        w._xfer_blocks_for_req = lambda req_id, meta: w.final_pushes.append(
+            (req_id, meta)
+        )
+        return w
+
+    def complete_writes(self, state: str = "DONE") -> None:
+        for h in self.xfer_state:
+            self.xfer_state[h] = state
+
+
+def _save_meta(req_id, blocks, total, final, last=False) -> NixlConnectorMetadata:
+    meta = NixlConnectorMetadata()
+    meta.reqs_to_save[req_id] = MagicMock(
+        local_block_ids=(blocks,),
+        push_total_blocks=total,
+        push_final_blocks=final,
+        push_last_save=last,
+    )
+    return meta
+
+
+class TestEarlyPushSaves:
+    def _worker(self):
+        w = _EarlyWorker.make()
+        handles: list[_Handle] = []
+        w.saved = handles
+
+        w.next_done = False
+
+        def save(metadata):
+            hs = {rid: [_Handle(w.next_done)] for rid in metadata.reqs_to_save}
+            for h in hs.values():
+                handles.extend(h)
+            return hs
+
+        return w, save
+
+    def test_blocks_are_handed_once_their_save_is_done(self):
+        w, save = self._worker()
+        with patch.object(
+            NixlBaseConnectorWorker, "save_kv_to_host", new=lambda s, m: save(m)
+        ):
+            w.save_kv_to_host(_save_meta("req-p", [10, 11], total=5, final=2))
+            assert w._early_blocks_inbox.empty()  # save still in flight
+            w.saved[0]._done = True
+            w._poll_early_saves()
+            assert w._early_blocks_inbox.get_nowait() == (
+                "req-p",
+                5,
+                [(0, 10), (1, 11)],
+            )
+            assert w._push_writer_wake.is_set()
+
+            # Final chunk: the prompt's last block always waits for the final
+            # WRITE, and the request stops being tracked.
+            w.next_done = True
+            w.save_kv_to_host(_save_meta("req-p", [12, 13], total=5, final=4))
+            assert w._early_blocks_inbox.get_nowait() == (
+                "req-p",
+                5,
+                [(2, 12), (3, 13)],
+            )
+            w.save_kv_to_host(_save_meta("req-p", [14], total=5, final=5, last=True))
+            assert w._early_blocks_inbox.empty()
+            assert "req-p" not in w._early_saves
+
+    def test_saves_complete_in_position_order(self):
+        """A later chunk's save done before an earlier one hands nothing."""
+        w, save = self._worker()
+        with patch.object(
+            NixlBaseConnectorWorker, "save_kv_to_host", new=lambda s, m: save(m)
+        ):
+            w.save_kv_to_host(_save_meta("req-p", [10], total=4, final=1))
+            w.save_kv_to_host(_save_meta("req-p", [11], total=4, final=2))
+            w.saved[1]._done = True
+            w._poll_early_saves()
+            assert w._early_blocks_inbox.empty()
+            w.saved[0]._done = True
+            w._poll_early_saves()
+            assert w._early_blocks_inbox.get_nowait() == (
+                "req-p",
+                4,
+                [(0, 10), (1, 11)],
+            )
+
+    def test_synchronous_copy_op_hands_blocks_immediately(self):
+        w = _EarlyWorker.make()
+        with patch.object(
+            NixlBaseConnectorWorker, "save_kv_to_host", new=lambda s, m: {}
+        ):
+            w.save_kv_to_host(_save_meta("req-p", [10, 11], total=4, final=2))
+        assert w._early_blocks_inbox.get_nowait() == ("req-p", 4, [(0, 10), (1, 11)])
+
+    def test_failed_save_stops_early_push(self):
+        w, save = self._worker()
+        with patch.object(
+            NixlBaseConnectorWorker, "save_kv_to_host", new=lambda s, m: save(m)
+        ):
+            w.save_kv_to_host(_save_meta("req-p", [10], total=4, final=1))
+            w.saved[0].error = RuntimeError("copy failed")
+            w._poll_early_saves()
+        assert "req-p" not in w._early_saves
+        assert w._early_blocks_inbox.empty()
+
+    def test_request_dropped_by_scheduler_is_aborted(self):
+        w, save = self._worker()
+        with patch.object(
+            NixlBaseConnectorWorker, "save_kv_to_host", new=lambda s, m: save(m)
+        ):
+            w.save_kv_to_host(_save_meta("req-p", [10], total=4, final=1))
+            w.save_kv_to_host(_save_meta("req-p", [20, 21], total=0, final=0))
+        assert "req-p" not in w._early_saves
+        assert w._early_abort_inbox.get_nowait() == "req-p"
+
+
+@pytest.mark.parametrize("asynchronous", [True, False])
+def test_save_kv_to_host_returns_copy_op_handles(asynchronous):
+    """An asynchronous copy op's handles come back per request; a synchronous
+    op (returning None) leaves nothing to wait for."""
+    w = _StubWriterWorker.fresh()
+    w.use_host_buffer = True
+    w.device_kv_caches, w.host_xfer_buffers = {}, {}
+    w._logical_to_kernel_block_ids = lambda ids, ratio: ids
+    calls = []
+
+    def op(src, dst, s_ids, d_ids, direction):
+        calls.append((list(s_ids), direction))
+        return _Handle() if asynchronous else None
+
+    w.copy_blocks = op
+    meta = NixlConnectorMetadata()
+    meta.add_new_req_to_save("req-p", ([1, 2],), {})
+    handles = NixlBaseConnectorWorker.save_kv_to_host(w, meta)
+    assert calls == [([1, 2], "d2h")]
+    assert len(handles.get("req-p", [])) == (1 if asynchronous else 0)
+
+
+class TestEarlyPushWriter:
+    @staticmethod
+    def _ready(w, rid="req-p", total=5, blocks=((0, 10), (1, 11))):
+        w._early_blocks_inbox.put((rid, total, list(blocks)))
+        w._drain_early_inboxes()
+
+    def test_writes_wait_for_registration_then_map_suffix(self):
+        """D prefix-cached one block: P block i goes to D block i - 1."""
+        w = _EarlyWorker.make()
+        self._ready(w)
+        assert w.writes == []
+        reg = _registration_data("req-p", local_block_ids=([200, 201, 202, 203],))
+        w._handle_push_reg_notif(PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg))
+        # Position 0 is D's cached block: not written; position 1 -> D 200.
+        assert w.writes == [([11], [200], b"")]
+        st = w._early_pushes["req-p"]
+        assert st.written == {0: 10, 1: 11}
+        # The registration stays pending for the final push.
+        assert "req-p" in w._pending_d_registrations
+
+    def test_registration_first_then_blocks(self):
+        w = _EarlyWorker.make()
+        reg = _registration_data("req-p", local_block_ids=([200, 201, 202, 203, 204],))
+        w._pending_d_registrations["req-p"] = reg
+        self._ready(w)
+        assert w.writes == [([10, 11], [200, 201], b"")]
+
+    def test_parts_notif_when_d_accepts_them(self):
+        w = _EarlyWorker.make()
+        reg = _registration_data("req-p", local_block_ids=([200, 201, 202, 203, 204],))
+        reg["accepts_parts"] = True
+        w._pending_d_registrations["req-p"] = reg
+        self._ready(w)
+        ((_, _, notif),) = w.writes
+        assert notif.startswith(PUSH_PART_NOTIF_PREFIX)
+        part = msgspec.msgpack.decode(notif[len(PUSH_PART_NOTIF_PREFIX) :])
+        assert part == {"request_id": "req-p", "block_ids": [200, 201]}
+
+    @pytest.mark.parametrize("geometry", [{"remote_tp": 2}, {"remote_block_size": 32}])
+    def test_different_geometry_is_left_to_the_final_push(self, geometry):
+        w = _EarlyWorker.make(**geometry)
+        w._pending_d_registrations["req-p"] = _registration_data(
+            "req-p", local_block_ids=([200, 201, 202, 203, 204],)
+        )
+        self._ready(w)
+        assert w.writes == []
+        assert w._early_pushes["req-p"].failed
+
+    def test_final_push_waits_for_early_writes_and_skips_them(self):
+        w = _EarlyWorker.make()
+        reg = _registration_data("req-p", local_block_ids=([200, 201, 202, 203, 204],))
+        w._pending_d_registrations["req-p"] = reg
+        self._ready(w)
+        assert len(w.writes) == 1
+
+        # Request finishes while the early WRITE is in flight: deferred.
+        w._finished_blocks_inbox.put(("req-p", ([10, 11, 12, 13, 14],)))
+        rid, blocks = w._finished_blocks_inbox.get_nowait()
+        w._do_start_push_kv(rid, blocks, w._pop_matching_registration(rid))
+        assert w.final_pushes == []
+        w._poll_early_writes()
+        assert w.final_pushes == []
+
+        w.complete_writes()
+        w._poll_early_writes()
+        ((req_id, meta),) = w.final_pushes
+        assert req_id == "req-p"
+        assert meta.local_block_ids == ([12, 13, 14],)
+        assert meta.remote.block_ids == ([202, 203, 204],)
+        assert "req-p" not in w._early_pushes
+
+    def test_failed_early_write_makes_the_final_push_cover_every_block(self):
+        w = _EarlyWorker.make()
+        reg = _registration_data("req-p", local_block_ids=([200, 201, 202, 203, 204],))
+        w._pending_d_registrations["req-p"] = reg
+        self._ready(w)
+        w.complete_writes("ERR")
+        w._poll_early_writes()
+        w._do_start_push_kv("req-p", ([10, 11, 12, 13, 14],), reg)
+        ((_, meta),) = w.final_pushes
+        assert meta.local_block_ids == ([10, 11, 12, 13, 14],)
+
+    def test_moved_blocks_make_the_final_push_cover_every_block(self):
+        w = _EarlyWorker.make()
+        reg = _registration_data("req-p", local_block_ids=([200, 201, 202, 203, 204],))
+        w._pending_d_registrations["req-p"] = reg
+        self._ready(w)
+        w.complete_writes()
+        w._poll_early_writes()
+        w._do_start_push_kv("req-p", ([10, 99, 12, 13, 14],), reg)
+        ((_, meta),) = w.final_pushes
+        assert meta.local_block_ids == ([10, 99, 12, 13, 14],)
+
+    def test_abort_waits_for_early_writes_then_tells_d(self):
+        w = _EarlyWorker.make()
+        w._remote_agents[_P_ENGINE] = {(0, 0): "d-agent"}
+        reg = _registration_data("req-p", local_block_ids=([200, 201, 202, 203, 204],))
+        w._pending_d_registrations["req-p"] = reg
+        self._ready(w)
+
+        w._early_abort_inbox.put("req-p")
+        w._drain_early_inboxes()
+        w.nixl_wrapper.send_notif.assert_not_called()
+        w.complete_writes()
+        w._poll_early_writes()
+        w.nixl_wrapper.send_notif.assert_called_once_with(
+            "d-agent", notif_msg=PUSH_ABORT_NOTIF_PREFIX + b"req-p"
+        )
+        assert "req-p" not in w._early_pushes
+        assert "req-p" not in w._pending_d_registrations
+
+    def test_abort_before_registration_answers_the_late_push_reg(self):
+        w = _EarlyWorker.make()
+        w._remote_agents[_P_ENGINE] = {(0, 0): "d-agent"}
+        w._early_abort_inbox.put("req-p")
+        w._drain_early_inboxes()
+        w.nixl_wrapper.send_notif.assert_not_called()
+        reg = _registration_data("req-p")
+        w._handle_push_reg_notif(PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg))
+        w.nixl_wrapper.send_notif.assert_called_once_with(
+            "d-agent", notif_msg=PUSH_ABORT_NOTIF_PREFIX + b"req-p"
+        )
+        assert "req-p" not in w._pending_d_registrations
+
+    def test_eviction_releases_state_after_inflight_writes(self):
+        w = _EarlyWorker.make()
+        w._pending_d_registrations["req-p"] = _registration_data(
+            "req-p", local_block_ids=([200, 201, 202, 203, 204],)
+        )
+        self._ready(w)
+        w._evict_early_push("req-p")
+        assert "req-p" in w._early_pushes
+        w.complete_writes()
+        w._poll_early_writes()
+        assert "req-p" not in w._early_pushes
+
+
+class TestEarlyPushDecode:
+    @staticmethod
+    def _d_worker():
+        w = _StubWriterWorker.fresh()
+        w.use_host_buffer = True
+        w.copies: list[tuple[list[int], str]] = []
+        w.copy_blocks = lambda src, dst, s_ids, d_ids, direction: w.copies.append(
+            (list(s_ids), direction)
+        )
+        w.host_xfer_buffers = {}
+        w.device_kv_caches = {}
+        w._logical_to_kernel_block_ids = lambda ids, ratio: ids
+        w.transfer_topo = MagicMock()
+        w._recving_metadata["req-d"] = MagicMock()
+        return w
+
+    def test_parts_are_copied_on_arrival_and_skipped_at_completion(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+            ReqMeta,
+        )
+
+        w = self._d_worker()
+        part = PUSH_PART_NOTIF_PREFIX + msgspec.msgpack.encode(
+            {"request_id": "req-d", "block_ids": [200, 201]}
+        )
+        w._pending_completion_notifs.put(part)
+        assert w._get_new_notifs() == set()
+        assert w.copies == [([200, 201], "h2d")]
+
+        meta = ReqMeta(
+            local_block_ids=([200, 201, 202],),
+            local_physical_block_ids=([200, 201, 202],),
+            tp_size=1,
+        )
+        w.sync_recved_kv_to_device("req-d", meta)
+        assert w.copies[-1] == ([202], "h2d")
+        # The caller's meta still lists every block (post-processing uses it).
+        assert meta.local_physical_block_ids == ([200, 201, 202],)
+        assert "req-d" not in w._push_parts_loaded
+
+    def test_abort_notif_fails_the_receive(self):
+        w = self._d_worker()
+        w._pending_completion_notifs.put(PUSH_ABORT_NOTIF_PREFIX + b"req-d")
+        w._get_new_notifs()
+        assert w._failed_recv_reqs.get_nowait() == "req-d"
+
+    def test_expired_registration_fails_the_receive(self):
+        w = self._d_worker()
+        meta = NixlConnectorMetadata()
+        meta.push_expired_recvs = {"req-d", "req-unknown"}
+        w.start_load_kv(meta)
+        assert w._failed_recv_reqs.get_nowait() == "req-d"
+        assert w._failed_recv_reqs.empty()
+
+    def test_registration_accepts_parts_with_host_buffer(self):
+        w = self._d_worker()
+        w.nixl_wrapper = MagicMock()
+        w._remote_agents["prefill-engine"] = {(0, 0): "p-agent"}
+        w._do_send_reg_notif("req-d", _registration_data("req-d"))
+        notif = w.nixl_wrapper.send_notif.call_args.kwargs["notif_msg"]
+        reg = msgspec.msgpack.decode(notif[len(PUSH_REG_NOTIF_PREFIX) :])
+        assert reg["accepts_parts"] is True

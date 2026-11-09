@@ -572,6 +572,7 @@ def make_nixl_push_scheduler(
     push_registration_timeout: float | None = None,
     is_bidirectional_kv_xfer_enabled: bool = False,
     has_mamba: bool = False,
+    early_push: bool = False,
 ):
     """Create a NixlPushConnectorScheduler via __new__ (skipping __init__).
 
@@ -620,6 +621,12 @@ def make_nixl_push_scheduler(
     sched._push_registration_deadlines = {}
     sched._finished_request_blocks = {}
     sched._newly_finished_push_blocks = {}
+    sched._push_expired_recvs = set()
+    sched._early_push = early_push
+    sched._early_push_off = set()
+    sched.block_size = 16
+    if early_push:
+        sched.use_host_buffer = True
     sched._push_registration_timeout = (
         push_registration_timeout
         if push_registration_timeout is not None

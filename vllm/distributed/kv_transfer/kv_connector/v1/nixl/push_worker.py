@@ -29,13 +29,32 @@ lease expires (the base worker reports it via ``done_sending``) or the WRITE com
 ``get_finished`` enqueues an eviction onto ``_evict_finished_inbox`` so
 the writer drops any leftover ``_push_finished_blocks`` /
 ``_pending_d_registrations`` and stops self-polling.
+
+Early push (host-buffer saves only). While a request still prefills, the
+scheduler reports after each chunk how many of its leading blocks hold final
+KV. The main thread keeps the request's saved blocks in position order and,
+once an asynchronous copy op reports a chunk's save done (a synchronous op's
+are done on return), hands the final blocks to the writer
+(``_early_blocks_inbox``). Once D's PUSH_REG has arrived, the writer WRITEs
+them to D's blocks with the same suffix alignment as the final push (P block
+``i`` -> D block ``i - (N - len(D blocks))``), never the prompt's last block.
+When the request finishes, the final WRITE (which carries the completion
+notif) covers only the blocks not yet written, and is posted only after every
+early WRITE is done, so D never sees completion before all its blocks landed.
+Early WRITEs are tracked apart from ``_sending_transfers``; one that fails
+makes the final WRITE cover every block. A D that set ``accepts_parts`` in its
+PUSH_REG gets a PUSH_PART notif with each early WRITE and copies those blocks
+to the device as they arrive. If P aborts the request, the writer waits for
+its early WRITEs and sends PUSH_ABORT so D fails the receive.
 """
 
+import dataclasses
 import queue
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -48,6 +67,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
     NixlBaseConnectorWorker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    PUSH_ABORT_NOTIF_PREFIX,
+    PUSH_PART_NOTIF_PREFIX,
     PUSH_REG_NOTIF_PREFIX,
     NixlConnectorMetadata,
     RemoteMeta,
@@ -61,6 +82,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import get_base_request_id
 from vllm.logger import init_logger
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
 if TYPE_CHECKING:
     import torch
@@ -75,6 +97,42 @@ logger = init_logger(__name__)
 # main thread (start_load_kv / get_finished). Smaller -> lower latency
 # while active, slightly more CPU.
 _PUSH_WRITER_POLL_INTERVAL_MS = 1.0
+
+
+@dataclass
+class _EarlySaves:
+    """Main thread: a prefilling request's host-buffer saves (early push)."""
+
+    total: int
+    # P logical block ids, in position order.
+    blocks: list[int] = field(default_factory=list)
+    # (end position, copy-op handles) per save not yet known to be done.
+    pending: deque[tuple[int, list[Any]]] = field(default_factory=deque)
+    done: int = 0
+    final: int = 0
+    handed: int = 0
+
+
+@dataclass
+class _EarlyPush:
+    """Writer thread: a request's early WRITEs to D."""
+
+    total: int
+    # Saved final blocks not yet written, by position.
+    ready: dict[int, int] = field(default_factory=dict)
+    # Blocks written (or being written), by position.
+    written: dict[int, int] = field(default_factory=dict)
+    inflight: list[TransferHandle] = field(default_factory=list)
+    reg: dict[str, Any] | None = None
+    # Early WRITEs stopped; the final WRITE covers every block.
+    failed: bool = False
+    # The request finished while early WRITEs were in flight.
+    finish: tuple[BlockIds, dict[str, Any]] | None = None
+    # Aborted on P (PUSH_ABORT once the early WRITEs are done) or evicted.
+    abort: bool = False
+    evicted: bool = False
+    # A handshake with D is in progress.
+    handshaking: bool = False
 
 
 class NixlPushConnectorWorker(NixlBaseConnectorWorker):
@@ -126,6 +184,29 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # Handshakes that have just completed and are ready for the WRITE on wthread
         self._deferred_push_inbox = queue.Queue[tuple[str, BlockIds, dict[str, Any]]]()
 
+        # Early push (see module docstring).
+        # Main thread: saves of prefilling requests, by P request id.
+        self._early_saves: dict[ReqId, _EarlySaves] = {}
+        # Main thread -> writer: (req_id, prompt blocks, [(position, block)]).
+        self._early_blocks_inbox: queue.Queue[
+            tuple[str, int, list[tuple[int, int]]]
+        ] = queue.Queue()
+        # Main thread -> writer: P requests aborted (or preempted) mid-prefill.
+        self._early_abort_inbox: queue.Queue[str] = queue.Queue()
+        # Writer: early WRITE state by P request id.
+        self._early_pushes: dict[ReqId, _EarlyPush] = {}
+        # Writer: aborted P requests, with the time until which a PUSH_REG
+        # for them (late, or one per D rank) is answered with PUSH_ABORT.
+        self._aborted_reqs: dict[ReqId, float] = {}
+        assert vllm_config.kv_transfer_config is not None
+        self._aborted_req_ttl = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "kv_lease_duration", 30
+            )
+        )
+        # D side: physical blocks already copied to the device from PUSH_PARTs.
+        self._push_parts_loaded: dict[ReqId, set[int]] = {}
+
         # Wake signal from engine main thread (start_load_kv / get_finished).
         # Writer self-polls at _PUSH_WRITER_POLL_INTERVAL_MS while it has
         # active in-flight state; otherwise it blocks until signalled.
@@ -164,6 +245,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                     self.nixl_wrapper.release_xfer_handle(handle)
             self._sending_transfers.clear()
             self._send_failures.clear()
+        for st in self._early_pushes.values():
+            for handle in st.inflight:
+                self.nixl_wrapper.release_xfer_handle(handle)
+        self._early_pushes.clear()
         super().shutdown()
 
     # --- Engine-main-thread entry point -------------------------------- #
@@ -202,9 +287,20 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 self._reg_send_inbox.put((req_id, reg_data))
             self._push_writer_wake.set()
 
+        # --- D-side: receives whose registration watchdog expired ---
+        for req_id in metadata.push_expired_recvs:
+            if req_id in self._recving_metadata:
+                self._failed_recv_reqs.put(req_id)
+
+        # --- P-side: early push of saves that landed since the last step ---
+        self._poll_early_saves()
+
         # --- P-side: newly finished blocks awaiting a D registration match ---
         if metadata.push_finished_blocks:
             for req_id, block_ids in metadata.push_finished_blocks.items():
+                # Every save of a finished request has landed: hand the rest
+                # to the final WRITE.
+                self._early_saves.pop(req_id, None)
                 self._finished_blocks_inbox.put((req_id, block_ids))
             self._push_writer_wake.set()
 
@@ -214,6 +310,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         for req_id in metadata.reqs_not_processed:
             self._reqs_to_process.discard(req_id)
             assert req_id not in self._reqs_to_send
+            # Aborted on P: D must not wait for a push that never completes.
+            self._early_saves.pop(req_id, None)
+            self._early_abort_inbox.put(req_id)
+            self._push_writer_wake.set()
         # Rebase scheduler-clock deadlines onto this worker's clock — see the
         # equivalent block in pull_worker.start_load_kv for the rationale.
         now_local = time.perf_counter()
@@ -251,6 +351,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                         break
                     self._do_start_push_kv(rid, blocks, rd)
 
+                # 2b. Early push: saved blocks, aborts, WRITE completions.
+                self._drain_early_inboxes()
+                self._poll_early_writes()
+
                 # 3. P-side finished blocks; match against pending regs.
                 while True:
                     try:
@@ -274,6 +378,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                         break
                     self._push_finished_blocks.pop(rid, None)
                     self._pending_d_registrations.pop(rid, None)
+                    self._evict_early_push(rid)
 
                 # 4. NIXL notifs: route PUSH_REG; forward the rest.
                 for notifs in self.nixl_wrapper.get_new_notifs().values():
@@ -286,9 +391,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 logger.exception("nixl-push-writer error; continuing")
 
             # Self-poll only while there is no other wake source: P-side
-            # finished blocks waiting for a D PUSH_REG match. All other
-            # progress is event-driven (see module docstring).
-            if self._push_finished_blocks:
+            # finished blocks or early pushes waiting for a D PUSH_REG match,
+            # and early WRITEs in flight. All other progress is event-driven
+            # (see module docstring).
+            if self._push_finished_blocks or self._early_pushes:
                 self._push_writer_stop.wait(timeout=sleep_s)
             else:
                 self._push_writer_wake.wait()
@@ -305,12 +411,20 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             logger.warning("PUSH_REG notif missing request_id; dropping")
             return
 
+        if self._is_aborted(rid):
+            self._send_push_abort(reg_data)
+            return
+
         match = self._pop_matching_finished_blocks(rid)
         if match is not None:
             fin_id, blocks = match
             self._do_start_push_kv(fin_id, blocks, reg_data)
         else:
             self._pending_d_registrations[rid] = reg_data
+            early = self._match_early_push(rid)
+            if early is not None and early[1].reg is None:
+                early[1].reg = reg_data
+                self._post_early_writes(*early)
 
     # --- D-side registration send (writer thread) ---------------------- #
 
@@ -363,6 +477,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:
         engine_id = reg_data["remote_engine_id"]
+        if self._accepts_push_parts():
+            reg_data = {**reg_data, "accepts_parts": True}
         notif_msg = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg_data)
         # _remote_agents is mutated on other threads; snapshot under the lock.
         with self._handshake_lock:
@@ -445,7 +561,17 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         """
         if not local_block_ids:
             logger.warning("No local blocks to push for request %s", request_id)
+            self._evict_early_push(request_id)
             return
+
+        early = self._early_pushes.get(request_id)
+        if early is not None:
+            if early.inflight:
+                # Completion must not reach D before every early WRITE landed;
+                # ``_poll_early_writes`` re-drives this once they are done.
+                early.finish = (local_block_ids, registration_data)
+                return
+            del self._early_pushes[request_id]
 
         # ``local_block_ids`` are P's logical block IDs; ``remote_block_ids``
         # (D's, from the PUSH_REG notif) are also logical.
@@ -485,6 +611,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
         logical_local = self._as_grouped_block_ids(local_block_ids)
         logical_remote = self._as_grouped_block_ids(remote_block_ids)
+        if early is not None:
+            logical_local, logical_remote = self._skip_early_written(
+                request_id, early, logical_local, logical_remote
+            )
         physical_local = self._logical_to_kernel_block_ids(
             logical_local, self._physical_blocks_per_logical_kv_block
         )
@@ -687,27 +817,9 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 f"{len(remote_block_ids[i])} remote blocks"
             )
 
-        # Get descs ids.
-        remote_block_descs_ids = self._compute_desc_ids(
-            block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
-            block_size_ratio=None,
-            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
-            region_num_blocks=self.dst_region_num_blocks[dst_engine_id],
-            region_group_ids=self.dst_region_group_ids[dst_engine_id],
-            uses_region_group_mapping=self.dst_uses_region_group_mapping[dst_engine_id],
+        local_block_descs_ids, remote_block_descs_ids = self._write_desc_ids(
+            local_block_ids, remote_block_ids, dst_engine_id, block_size_ratio
         )
-        local_block_descs_ids = self._compute_desc_ids(
-            block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
-            block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-            region_num_blocks=self.dst_region_num_blocks[self.engine_id],
-            region_group_ids=self.region_group_ids,
-            uses_region_group_mapping=self._uses_region_group_mapping,
-        )
-
-        assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
         handle = None
         try:
@@ -742,6 +854,422 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 return handle
             return None
 
+    def _write_desc_ids(
+        self,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        dst_engine_id: str,
+        block_size_ratio: int,
+    ):
+        """Descriptor ids of a WRITE of kernel blocks to *dst_engine_id*."""
+        assert self.transfer_topo is not None
+        remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
+        remote_block_descs_ids = self._compute_desc_ids(
+            block_ids=remote_block_ids,
+            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
+            block_size_ratio=None,
+            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
+            region_num_blocks=self.dst_region_num_blocks[dst_engine_id],
+            region_group_ids=self.dst_region_group_ids[dst_engine_id],
+            uses_region_group_mapping=self.dst_uses_region_group_mapping[dst_engine_id],
+        )
+        local_block_descs_ids = self._compute_desc_ids(
+            block_ids=local_block_ids,
+            dst_num_blocks=self.dst_num_blocks[self.engine_id],
+            block_size_ratio=block_size_ratio,
+            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+            region_num_blocks=self.dst_region_num_blocks[self.engine_id],
+            region_group_ids=self.region_group_ids,
+            uses_region_group_mapping=self._uses_region_group_mapping,
+        )
+        assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+        return local_block_descs_ids, remote_block_descs_ids
+
+    # --- Early push: main thread --------------------------------------- #
+
+    def save_kv_to_host(self, metadata: NixlConnectorMetadata) -> dict[ReqId, list]:
+        handles = super().save_kv_to_host(metadata)
+        for req_id, meta in metadata.reqs_to_save.items():
+            saves = self._early_saves.get(req_id)
+            if meta.push_total_blocks <= 0:
+                if saves is not None:
+                    # The scheduler stopped early push for this request (its
+                    # blocks were rebuilt): written positions no longer hold.
+                    del self._early_saves[req_id]
+                    self._early_abort_inbox.put(req_id)
+                    self._push_writer_wake.set()
+                continue
+            if saves is None:
+                saves = self._early_saves[req_id] = _EarlySaves(
+                    total=meta.push_total_blocks
+                )
+            saves.blocks.extend(meta.local_block_ids[0])
+            saves.pending.append((len(saves.blocks), handles.get(req_id, [])))
+            saves.final = meta.push_final_blocks
+        self._poll_early_saves()
+        for req_id, meta in metadata.reqs_to_save.items():
+            if meta.push_last_save:
+                # The rest goes with the final WRITE.
+                self._early_saves.pop(req_id, None)
+        return handles
+
+    def _poll_early_saves(self) -> None:
+        """Hand saved final blocks to the writer. Runs on the model thread,
+        where the copy op's handles are polled."""
+        handed = False
+        for req_id, saves in list(self._early_saves.items()):
+            try:
+                while saves.pending and all(h.done() for h in saves.pending[0][1]):
+                    saves.done = saves.pending.popleft()[0]
+            except Exception as e:
+                # The step that completes the prompt waits for its saves and
+                # raises; here, just stop pushing this request early.
+                logger.warning("Early push of %s stopped: save failed (%s)", req_id, e)
+                del self._early_saves[req_id]
+                continue
+            # The prompt's last block always goes with the final WRITE, which
+            # therefore never has an empty block list.
+            ready = min(saves.done, saves.final, saves.total - 1)
+            if ready > saves.handed:
+                blocks = [
+                    (pos, saves.blocks[pos]) for pos in range(saves.handed, ready)
+                ]
+                self._early_blocks_inbox.put((req_id, saves.total, blocks))
+                saves.handed = ready
+                handed = True
+        if handed:
+            self._push_writer_wake.set()
+
+    # --- Early push: writer thread ------------------------------------- #
+
+    def _drain_early_inboxes(self) -> None:
+        while True:
+            try:
+                rid, total, blocks = self._early_blocks_inbox.get_nowait()
+            except queue.Empty:
+                break
+            st = self._early_pushes.get(rid)
+            if st is None:
+                st = self._early_pushes[rid] = _EarlyPush(total=total)
+                st.reg = self._peek_matching_registration(rid)
+            st.ready.update(blocks)
+            self._post_early_writes(rid, st)
+        while True:
+            try:
+                rid = self._early_abort_inbox.get_nowait()
+            except queue.Empty:
+                break
+            self._abort_early_push(rid)
+
+    def _peek_matching_registration(self, request_id: str) -> dict[str, Any] | None:
+        data = self._pending_d_registrations.get(request_id)
+        if data is not None:
+            return data
+        base_id = get_base_request_id(request_id)
+        for reg_id, data in self._pending_d_registrations.items():
+            if get_base_request_id(reg_id) == base_id:
+                return data
+        return None
+
+    def _match_early_push(self, request_id: str) -> tuple[str, _EarlyPush] | None:
+        st = self._early_pushes.get(request_id)
+        if st is not None:
+            return request_id, st
+        base_id = get_base_request_id(request_id)
+        for rid, st in self._early_pushes.items():
+            if get_base_request_id(rid) == base_id:
+                return rid, st
+        return None
+
+    def _early_write_target(self, rid: str, st: _EarlyPush) -> tuple[str, int] | None:
+        """D engine and rank for early WRITEs, or None to leave every block to
+        the final WRITE. Only a layout where P block ``i`` is exactly D block
+        ``i - offset`` qualifies: same TP, block size and kernel blocks per
+        logical block, one destination rank, same cache groups."""
+        assert st.reg is not None and self.transfer_topo is not None
+        engine_id = st.reg["decode_engine_id"]
+        if engine_id not in self.tp_mappings:
+            return None
+        info = self.transfer_topo.get_engine_info(engine_id)
+        plan = self.tp_mappings[engine_id]
+        if (
+            info.remote_tp_size != self.world_size
+            or info.remote_block_size != self.block_size
+            or info.remote_physical_blocks_per_logical
+            != self._physical_blocks_per_logical_kv_block
+            or len(plan.all_source_ranks) != 1
+            or self.region_group_ids != self.dst_region_group_ids[engine_id]
+        ):
+            return None
+        return engine_id, plan.all_source_ranks[0]
+
+    def _post_early_writes(self, rid: str, st: _EarlyPush) -> None:
+        if (
+            st.failed
+            or st.abort
+            or st.handshaking
+            or st.finish is not None
+            or st.reg is None
+            or not st.ready
+        ):
+            return
+        reg = st.reg
+        fut = self._ensure_handshake(
+            reg["decode_engine_id"],
+            reg["decode_host"],
+            reg["decode_port"],
+            reg["decode_tp_size"],
+        )
+        if fut is not None:
+            # ``_poll_early_writes`` retries once it is done.
+            st.handshaking = True
+
+            def _on_handshake(f: Future, st: _EarlyPush = st) -> None:
+                if f.exception() is not None:
+                    st.failed = True
+                st.handshaking = False
+                self._push_writer_wake.set()
+
+            fut.add_done_callback(_on_handshake)
+            return
+        target = self._early_write_target(rid, st)
+        d_blocks = self._as_grouped_block_ids(reg["local_block_ids"])
+        offset = st.total - len(d_blocks[0]) if len(d_blocks) == 1 else -1
+        if target is None or offset < 0:
+            st.failed = True
+            st.ready.clear()
+            return
+        engine_id, rank = target
+        positions = sorted(p for p in st.ready if p >= offset)
+        for p in [p for p in st.ready if p < offset]:
+            # D holds this block from its prefix cache.
+            st.written[p] = st.ready.pop(p)
+        if not positions:
+            return
+        local = [st.ready[p] for p in positions]
+        remote = [d_blocks[0][p - offset] for p in positions]
+        notif = b""
+        if reg.get("accepts_parts"):
+            notif = PUSH_PART_NOTIF_PREFIX + msgspec.msgpack.encode(
+                {"request_id": reg["request_id"], "block_ids": remote}
+            )
+        remote_info = self.transfer_topo.get_engine_info(engine_id)
+        local_phys = self._logical_to_kernel_block_ids(
+            (local,), self._physical_blocks_per_logical_kv_block
+        )
+        remote_phys = self._logical_to_kernel_block_ids(
+            (remote,), remote_info.remote_physical_blocks_per_logical
+        )
+        handle = None
+        try:
+            local_descs, remote_descs = self._write_desc_ids(
+                local_phys, remote_phys, engine_id, 1
+            )
+            handle = self.nixl_wrapper.make_prepped_xfer(
+                "WRITE",
+                self.src_xfer_handles_by_block_size[remote_info.remote_block_size],
+                local_descs,
+                self.dst_xfer_side_handles[engine_id][rank],
+                remote_descs,
+                notif_msg=notif,
+            )
+            self.nixl_wrapper.transfer(handle)
+        except Exception as e:
+            self._log_failure(
+                failure_type="early_push_setup_failed",
+                req_id=rid,
+                msg="Early push WRITE submission failed; the final WRITE covers "
+                "every block",
+                error=e,
+                dst_engine_id=engine_id,
+            )
+            st.failed = True
+            if handle is not None and not self._try_release_xfer_handle(rid, handle):
+                st.inflight.append(handle)
+            return
+        self._engine_last_active[engine_id] = time.perf_counter()
+        st.inflight.append(handle)
+        for p in positions:
+            st.written[p] = st.ready.pop(p)
+
+    def _poll_early_writes(self) -> None:
+        for rid, st in list(self._early_pushes.items()):
+            in_progress = []
+            for handle in st.inflight:
+                try:
+                    state = self.nixl_wrapper.check_xfer_state(handle)
+                except Exception as e:
+                    state = f"exception: {e}"
+                if state == "PROC":
+                    in_progress.append(handle)
+                    continue
+                if state == "DONE":
+                    self.xfer_stats.record_transfer(
+                        self.nixl_wrapper.get_xfer_telemetry(handle)
+                    )
+                else:
+                    self._log_failure(
+                        failure_type="early_push_failed",
+                        req_id=rid,
+                        xfer_state=state,
+                    )
+                    st.failed = True
+                if not self._try_release_xfer_handle(rid, handle):
+                    in_progress.append(handle)
+            st.inflight = in_progress
+            if in_progress:
+                continue
+            if st.ready:
+                self._post_early_writes(rid, st)
+                if st.inflight:
+                    continue
+            if st.evicted:
+                del self._early_pushes[rid]
+            elif st.abort:
+                del self._early_pushes[rid]
+                self._finish_abort(rid, st.reg)
+            elif st.finish is not None:
+                blocks, reg = st.finish
+                st.finish = None
+                self._do_start_push_kv(rid, blocks, reg)
+
+    def _skip_early_written(
+        self,
+        rid: str,
+        st: _EarlyPush,
+        local: BlockIds,
+        remote: BlockIds,
+    ) -> tuple[BlockIds, BlockIds]:
+        """Drop the blocks early WRITEs already delivered from the final push.
+
+        Falls back to every block when the early WRITEs failed, went to
+        another D request, or the request's blocks no longer sit where they
+        were written."""
+        if st.failed or not st.written or len(local) != 1 or len(remote) != 1:
+            return local, remote
+        p_blocks, d_blocks = list(local[0]), list(remote[0])
+        offset = len(p_blocks) - len(d_blocks)
+        if (
+            st.total != len(p_blocks)
+            or offset < 0
+            or st.reg is None
+            or list(self._as_grouped_block_ids(st.reg["local_block_ids"])[0])
+            != d_blocks
+            or any(p_blocks[p] != b for p, b in st.written.items())
+        ):
+            logger.warning(
+                "Early push of %s does not match its final blocks; pushing every block",
+                rid,
+            )
+            return local, remote
+        keep = [p for p in range(offset, len(p_blocks)) if p not in st.written]
+        return ([p_blocks[p] for p in keep],), ([d_blocks[p - offset] for p in keep],)
+
+    def _evict_early_push(self, rid: str) -> None:
+        st = self._early_pushes.get(rid)
+        if st is None:
+            return
+        if st.inflight:
+            st.evicted = True
+        else:
+            del self._early_pushes[rid]
+
+    def _abort_early_push(self, rid: str) -> None:
+        """P aborted *rid*: once its early WRITEs are done, tell D."""
+        self._push_finished_blocks.pop(rid, None)
+        st = self._early_pushes.get(rid)
+        reg = self._pop_matching_registration(rid)
+        if st is not None:
+            st.reg = st.reg or reg
+            st.abort = True
+            st.ready.clear()
+            if st.inflight:
+                return
+            del self._early_pushes[rid]
+            reg = st.reg
+        self._finish_abort(rid, reg)
+
+    def _finish_abort(self, rid: str, reg: dict[str, Any] | None) -> None:
+        if reg is not None:
+            self._send_push_abort(reg)
+        now = time.perf_counter()
+        for old, until in list(self._aborted_reqs.items()):
+            if until < now:
+                del self._aborted_reqs[old]
+        self._aborted_reqs[rid] = now + self._aborted_req_ttl
+
+    def _is_aborted(self, request_id: str) -> bool:
+        if not self._aborted_reqs:
+            return False
+        if request_id in self._aborted_reqs:
+            return True
+        base_id = get_base_request_id(request_id)
+        return any(get_base_request_id(rid) == base_id for rid in self._aborted_reqs)
+
+    def _send_push_abort(self, reg: dict[str, Any]) -> None:
+        """Best effort: without it D's registration watchdog fails the receive."""
+        engine_id = reg["decode_engine_id"]
+        with self._handshake_lock:
+            agents = dict(self._remote_agents.get(engine_id) or {})
+        if not agents:
+            logger.warning(
+                "Cannot send PUSH_ABORT for %s: no connection to engine %s",
+                reg["request_id"],
+                engine_id,
+            )
+            return
+        msg = PUSH_ABORT_NOTIF_PREFIX + str(reg["request_id"]).encode()
+        for agent_name in agents.values():
+            try:
+                self.nixl_wrapper.send_notif(agent_name, notif_msg=msg)
+            except Exception as e:
+                self._log_failure(
+                    failure_type="push_abort_notif_failed",
+                    req_id=reg["request_id"],
+                    error=e,
+                )
+
+    # --- D side: early parts ------------------------------------------- #
+
+    def _accepts_push_parts(self) -> bool:
+        """D copies early-written blocks to the device as they land (host
+        buffer only; device-buffer WRITEs need no copy)."""
+        return bool(self.use_host_buffer and self.copy_blocks is not None)
+
+    def _handle_push_part(self, payload: bytes) -> None:
+        try:
+            part = msgspec.msgpack.decode(payload)
+            req_id, block_ids = part["request_id"], list(part["block_ids"])
+        except Exception:
+            logger.exception("Failed to decode PUSH_PART notification payload")
+            return
+        if req_id not in self._recving_metadata or self.copy_blocks is None:
+            return
+        physical = self._logical_to_kernel_block_ids(
+            (block_ids,), self._physical_blocks_per_logical_kv_block
+        )[0]
+        with gpu_sync_allowed():
+            self.copy_blocks(
+                self.host_xfer_buffers,
+                self.device_kv_caches,
+                physical,
+                physical,
+                "h2d",
+            )
+        self._push_parts_loaded.setdefault(req_id, set()).update(physical)
+
+    def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
+        loaded = self._push_parts_loaded.pop(req_id, None)
+        if loaded:
+            meta = dataclasses.replace(
+                meta,
+                local_physical_block_ids=tuple(
+                    [b for b in group if b not in loaded]
+                    for group in meta.local_physical_block_ids
+                ),
+            )
+        super().sync_recved_kv_to_device(req_id, meta)
+
     # --- Notification handling on engine main thread ------------------ #
 
     def _get_new_notifs(self) -> set[str]:
@@ -758,6 +1286,16 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 notif = self._pending_completion_notifs.get_nowait()
             except queue.Empty:
                 break
+
+            if notif.startswith(PUSH_PART_NOTIF_PREFIX):
+                self._handle_push_part(notif[len(PUSH_PART_NOTIF_PREFIX) :])
+                continue
+            if notif.startswith(PUSH_ABORT_NOTIF_PREFIX):
+                req_id = notif[len(PUSH_ABORT_NOTIF_PREFIX) :].decode()
+                if req_id in self._recving_metadata:
+                    logger.warning("Prefill aborted request %s; failing it", req_id)
+                    self._failed_recv_reqs.put(req_id)
+                continue
 
             msg = notif.decode("utf-8")
             if msg.startswith("HB:"):
@@ -812,8 +1350,11 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # notifs, late PUSH_REGs) even if it had been parked.
         self._push_writer_wake.set()
 
+        self._poll_early_saves()
         results = super().get_transfer_results()
         done_sending = results.finished_sending
+        for req_id in results.finished_recving:
+            self._push_parts_loaded.pop(req_id, None)
 
         # ``_pop_done_transfers`` mutates ``_sending_transfers``; the
         # writer thread also appends to it, so guard the pop.
