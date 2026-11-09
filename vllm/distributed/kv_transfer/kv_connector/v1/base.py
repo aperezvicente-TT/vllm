@@ -70,7 +70,11 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
-# s_tensor_list, d_tensor_list, s_indices, d_indices, direction
+# s_tensor_list, d_tensor_list, s_indices, d_indices, direction.
+# A synchronous op returns None once the copy is done. An asynchronous op
+# returns a handle whose ``done()`` reports completion (and raises if the copy
+# failed); the caller decides when it needs the copy, so such an op must order
+# the copy after the work already queued on the device.
 CopyBlocksOp = Callable[
     [
         dict[str, torch.Tensor],
@@ -79,7 +83,7 @@ CopyBlocksOp = Callable[
         list[int],
         Literal["h2d", "d2h"],
     ],
-    None,
+    Any,
 ]
 
 logger = init_logger(__name__)

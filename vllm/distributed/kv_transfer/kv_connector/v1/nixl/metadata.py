@@ -24,6 +24,14 @@ GET_META_MSG = b"get_meta_msg"
 # Sent worker-to-worker over NIXL: D worker -> P worker, encoded as
 # PUSH_REG_NOTIF_PREFIX + msgpack(registration_data).
 PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
+# Push mode, P worker -> D worker. PUSH_PART rides on an early WRITE (one that
+# P posts while the request still prefills) and names the D blocks it filled:
+# PUSH_PART_NOTIF_PREFIX + msgpack({"request_id", "block_ids"}). Sent only to a
+# D that set ``accepts_parts`` in its registration. PUSH_ABORT tells D that P
+# aborted the request and will not complete it: PUSH_ABORT_NOTIF_PREFIX + D's
+# request id.
+PUSH_PART_NOTIF_PREFIX = b"PUSH_PART:"
+PUSH_ABORT_NOTIF_PREFIX = b"PUSH_ABORT:"
 #
 # NIXL Connector Version
 #
@@ -53,8 +61,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  15: Add remote_registration_generation to kv_transfer_params
 #  16: Pair regions by the layers both sides hold: every peer advertises
 #      region_members and the cache group of each layer
+#  17: Push mode: early WRITEs during prefill, PUSH_PART and PUSH_ABORT notifs
 #
-NIXL_CONNECTOR_VERSION: int = 16
+NIXL_CONNECTOR_VERSION: int = 17
 
 
 @dataclass
@@ -270,6 +279,13 @@ class ReqMeta:
     # Worker-only, per-group range of the remote-sized sub-blocks of each local
     # group a pull covers. None derives it from the block counts.
     covered_sub_blocks: list[range] | None = None
+    # Push mode, P side, host-buffer saves of a request eligible for early
+    # WRITEs (else 0): the logical blocks of the whole prompt, and how many of
+    # the request's leading blocks hold final KV once this step's save lands.
+    # `push_last_save` marks the save of the step that completes the prompt.
+    push_total_blocks: int = 0
+    push_final_blocks: int = 0
+    push_last_save: bool = False
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -293,6 +309,9 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # Push mode (P side): newly finished request blocks to be matched
         # against pending D registrations on the P worker.
         self.push_finished_blocks: dict[ReqId, BlockIds] = {}
+        # Push mode (D side): receives whose registration watchdog expired;
+        # the D worker fails them.
+        self.push_expired_recvs: set[ReqId] = set()
 
     def _add_new_req(
         self,

@@ -14,12 +14,17 @@ In push mode, scheduler-side responsibilities are:
   `_newly_finished_push_blocks` so the P worker picks them up via
   `meta.push_finished_blocks` and matches against any D registrations
   it already received via NIXL notifications.
+* P side with host-buffer saves (early push): on every partial-prefill save
+  step, tell the P worker how many of the request's leading blocks hold final
+  KV (`ReqMeta.push_final_blocks`) and the prompt's block count, so it can
+  WRITE them to D while the rest of the prompt is still being computed.
 * Both sides: `has_pending_push_work` keeps the engine main loop stepping
   while pushes are in flight. `update_connector_output` cleans up
   `_finished_request_blocks` once the WRITE completes.
 
-A soft per-registration watchdog on the D scheduler fails requests that have
-been registered but not fulfilled within a configurable timeout.
+A per-registration watchdog on the D scheduler fails receives that have been
+registered but not fulfilled within `push_registration_timeout` (for
+example because P died mid-prefill).
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any
 
-from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
+from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
@@ -39,6 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
 )
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -99,6 +105,32 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 self.decoder_kv_blocks_ttl,
             )
         )
+        # D side: receives whose watchdog expired, for the D workers to fail.
+        self._push_expired_recvs: set[ReqId] = set()
+
+        # P side: WRITE a request's blocks to D while it still prefills, as
+        # each chunk's host-buffer save lands. Positions map onto D's blocks
+        # only when a block holds the same tokens on both sides from the first
+        # chunk on, so state groups (Mamba), sliding windows and tokens held
+        # back for D to recompute rule it out.
+        parallel_config = vllm_config.parallel_config
+        self._early_push: bool = bool(
+            self.use_host_buffer
+            and vllm_config.kv_transfer_config.get_from_extra_config(
+                "push_early_writes", True
+            )
+            and not self._is_hma_required
+            and not self._has_mamba
+            and self._prefill_backoff() == 0
+            and parallel_config.pipeline_parallel_size == 1
+            and parallel_config.decode_context_parallel_size == 1
+            and parallel_config.prefill_context_parallel_size == 1
+        )
+        # P side: requests that have saved blocks, and those whose block list
+        # was rebuilt since (preemption): their positions no longer match what
+        # was already written early.
+        self._early_push_started: set[ReqId] = set()
+        self._early_push_off: set[ReqId] = set()
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -249,6 +281,8 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         if not is_p_node:
             return False, None
 
+        self._early_push_started.discard(request.request_id)
+        self._early_push_off.discard(request.request_id)
         if request.status not in (
             RequestStatus.FINISHED_LENGTH_CAPPED,
             RequestStatus.FINISHED_STOPPED,
@@ -293,6 +327,33 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             transfer_mode=self._TRANSFER_MODE,
         )
 
+    def _build_save_meta(
+        self,
+        meta: NixlConnectorMetadata,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        reqs = dict(self._reqs_need_save)
+        super()._build_save_meta(meta, scheduler_output)
+        if not self._early_push:
+            return
+        for req_id, _, full_table in yield_req_data(scheduler_output):
+            if full_table and req_id in self._early_push_started:
+                self._early_push_off.add(req_id)
+        assert scheduler_output.num_scheduled_tokens is not None
+        for req_id, req_meta in meta.reqs_to_save.items():
+            req = reqs.get(req_id)
+            self._early_push_started.add(req_id)
+            if req is None or req_id in self._early_push_off:
+                continue
+            end = (
+                req.num_computed_tokens + scheduler_output.num_scheduled_tokens[req_id]
+            )
+            req_meta.push_total_blocks = cdiv(req.num_prompt_tokens, self.block_size)
+            req_meta.push_final_blocks = (
+                min(end, req.num_prompt_tokens) // self.block_size
+            )
+            req_meta.push_last_save = end >= req.num_prompt_tokens
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -300,11 +361,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, NixlConnectorMetadata)
 
-        # Watchdog: any D-side registration whose deadline has passed without
-        # a corresponding push completion is treated as failed and cleaned up.
-        # The corresponding request is already tracked via _reqs_need_recv;
-        # the engine layer will eventually time it out via the lease, but we
-        # at least drop the stale registration so we don't keep retrying.
+        # Watchdog: a D-side registration whose deadline passes without a push
+        # completion fails the receive (P may have died mid-prefill), so the
+        # request is recomputed or failed per `kv_load_failure_policy`
+        # instead of holding its blocks forever.
         now = time.perf_counter()
         # Deadlines are inserted in non-decreasing order (monotonic clock +
         # constant timeout, armed once per request), and dict insertion order
@@ -319,6 +379,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             self._push_registration_deadlines.pop(rid, None)
             # Avoid resending a registration that already timed out.
             self._push_pending_registrations.pop(rid, None)
+            self._push_expired_recvs.add(rid)
             logger.warning(
                 "NixlPushConnector: registration for request %s timed out "
                 "after %.1fs without a push completion",
@@ -330,6 +391,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         if self._push_pending_registrations:
             meta.push_registrations = dict(self._push_pending_registrations)
             self._push_pending_registrations.clear()
+
+        if self._push_expired_recvs:
+            meta.push_expired_recvs = self._push_expired_recvs
+            self._push_expired_recvs = set()
 
         # P side: package newly finished blocks for P workers to match against
         # any D registrations they have received via NIXL notifications.
@@ -344,7 +409,11 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # - finished P blocks awaiting WRITE completion, or
         # - pending D registrations the worker has not yet shipped, or
         # - newly finished blocks not yet shipped to P workers.
-        return bool(self._finished_request_blocks or self._push_pending_registrations)
+        return bool(
+            self._finished_request_blocks
+            or self._push_pending_registrations
+            or self._push_expired_recvs
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Clean up finished request blocks after push completes."""
