@@ -44,6 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
 )
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
@@ -109,13 +110,15 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         self._push_expired_recvs: set[ReqId] = set()
 
         # P side: WRITE a request's blocks to D while it still prefills, as
-        # each chunk's host-buffer save lands. Positions map onto D's blocks
+        # each chunk's host-buffer save lands, or, for device buffers on a
+        # platform whose transfers wait for the step that writes their blocks,
+        # as each chunk is enqueued. Positions map onto D's blocks
         # only when a block holds the same tokens on both sides from the first
         # chunk on, so state groups (Mamba), sliding windows and tokens held
         # back for D to recompute rule it out.
         parallel_config = vllm_config.parallel_config
         self._early_push: bool = bool(
-            self.use_host_buffer
+            (self.use_host_buffer or current_platform.nixl_device_writes_ordered())
             and vllm_config.kv_transfer_config.get_from_extra_config(
                 "push_early_writes", True
             )
@@ -179,8 +182,10 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
 
-        # P side with host-buffer offload: defer save to the worker.
-        if self.use_host_buffer and params.get("do_remote_decode"):
+        # P side with host-buffer offload: defer save to the worker. With
+        # device buffers and early push, track the request the same way so the
+        # worker learns which blocks each step makes final.
+        if (self.use_host_buffer or self._early_push) and params.get("do_remote_decode"):
             self._reqs_need_save[request.request_id] = request
             return
 
@@ -360,6 +365,9 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
     ) -> KVConnectorMetadata:
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, NixlConnectorMetadata)
+        if self._early_push and not self.use_host_buffer:
+            # Device buffers: no save, but the same per-step block accounting.
+            self._build_save_meta(meta, scheduler_output)
 
         # Watchdog: a D-side registration whose deadline passes without a push
         # completion fails the receive (P may have died mid-prefill), so the

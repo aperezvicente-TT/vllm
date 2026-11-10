@@ -30,14 +30,17 @@ lease expires (the base worker reports it via `done_sending`) or the WRITE compl
 the writer drops any leftover `_push_finished_blocks` /
 `_pending_d_registrations` and stops self-polling.
 
-Early push (host-buffer saves only). While a request still prefills, the
+Early push (host-buffer saves, or device buffers on a platform whose
+transfers wait for the step that writes their blocks:
+`Platform.nixl_device_writes_ordered`). While a request still prefills, the
 scheduler reports after each chunk how many of its leading blocks hold final
 KV. The main thread keeps the request's saved blocks in position order and,
 once an asynchronous copy op reports a chunk's save done (a synchronous op's
-are done on return), hands the final blocks to the writer
-(`_early_blocks_inbox`). Once D's PUSH_REG has arrived, the writer WRITEs
-them to D's blocks with the same suffix alignment as the final push (P block
-`i` -> D block `i - (N - len(D blocks))`), never the prompt's last block.
+are done on return; device buffers have no save, so at once), hands the final
+blocks to the writer (`_early_blocks_inbox`). Once D's PUSH_REG has arrived,
+the writer WRITEs them to D's blocks with the same suffix alignment as the
+final push (P block `i` -> D block `i - (N - len(D blocks))`), never the
+prompt's last block.
 When the request finishes, the final WRITE (which carries the completion
 notif) covers only the blocks not yet written, and is posted only after every
 early WRITE is done, so D never sees completion before all its blocks landed.
@@ -923,7 +926,23 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def save_kv_to_host(self, metadata: NixlConnectorMetadata) -> dict[ReqId, list]:
         handles = super().save_kv_to_host(metadata)
-        synchronous = getattr(self.copy_blocks, "synchronous", False)
+        self._note_saves(
+            metadata, handles, getattr(self.copy_blocks, "synchronous", False)
+        )
+        return handles
+
+    def note_device_saves(self, metadata: NixlConnectorMetadata) -> None:
+        # Device buffers on a platform whose transfers wait for the step that
+        # writes their blocks (Platform.nixl_device_writes_ordered): a block
+        # is ready to WRITE as soon as its step is enqueued.
+        self._note_saves(metadata, {}, synchronous=True)
+
+    def _note_saves(
+        self,
+        metadata: NixlConnectorMetadata,
+        handles: dict[ReqId, list],
+        synchronous: bool,
+    ) -> None:
         for req_id, meta in metadata.reqs_to_save.items():
             saves = self._early_saves.get(req_id)
             if req_id in self._early_off:
@@ -957,7 +976,6 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             if meta.push_last_save:
                 # The rest goes with the final WRITE.
                 self._early_saves.pop(req_id, None)
-        return handles
 
     def _poll_early_saves(self) -> None:
         """Hand saved final blocks to the writer. Runs on the model thread,

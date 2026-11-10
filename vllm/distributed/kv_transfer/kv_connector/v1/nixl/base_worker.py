@@ -3046,6 +3046,10 @@ class NixlBaseConnectorWorker:
                 ",".join(map(str, local_block_ids)),
             )
 
+    def note_device_saves(self, metadata: NixlConnectorMetadata) -> None:
+        """Device buffers: the step that just ran wrote the blocks of
+        ``metadata.reqs_to_save``. Only the push worker's early push uses it."""
+
     def save_kv_to_host(self, metadata: NixlConnectorMetadata) -> dict[ReqId, list]:
         """Copy kv from device to host buffer.
 

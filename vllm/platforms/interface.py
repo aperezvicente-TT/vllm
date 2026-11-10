@@ -1472,6 +1472,15 @@ class Platform:
         return None
 
     @classmethod
+    def nixl_device_writes_ordered(cls) -> bool:
+        """True when a NIXL transfer of device KV (``kv_buffer_device`` not
+        ``"cpu"``) posted after a step was enqueued is held by the platform's
+        transfer backend until that step has written the blocks it reads. The
+        push connector then WRITEs a request's final blocks while later chunks
+        are still computed, as it does after host-buffer saves."""
+        return False
+
+    @classmethod
     def check_max_model_len(cls, max_model_len: int) -> int:
         """Check max_model_len for the current platform."""
         return max_model_len

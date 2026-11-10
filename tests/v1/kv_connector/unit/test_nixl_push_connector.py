@@ -2460,6 +2460,47 @@ class TestEarlyPushSaves:
         assert w._early_abort_inbox.get_nowait() == "req-p"
 
 
+class TestEarlyPushDeviceBuffers:
+    """Device buffers on a platform whose transfers wait for the step that
+    writes their blocks: no save, blocks are final once their step is
+    enqueued."""
+
+    def test_device_steps_hand_final_blocks_at_once(self):
+        w = _EarlyWorker.make()
+        w.note_device_saves(_save_meta("req-p", [10, 11], total=5, final=2))
+        assert w._early_blocks_inbox.get_nowait() == ("req-p", 5, [(0, 10), (1, 11)])
+        w.note_device_saves(_save_meta("req-p", [12, 13], total=5, final=4))
+        assert w._early_blocks_inbox.get_nowait() == ("req-p", 5, [(2, 12), (3, 13)])
+        w.note_device_saves(_save_meta("req-p", [14], total=5, final=5, last=True))
+        assert w._early_blocks_inbox.empty()  # the last block goes with the final WRITE
+        assert "req-p" not in w._early_saves
+
+    def test_wait_for_save_routes_device_steps(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+            NixlPushConnector,
+        )
+
+        conn = object.__new__(NixlPushConnector)
+        conn.connector_worker = MagicMock(use_host_buffer=False)
+        conn._connector_metadata = _save_meta("req-p", [10], total=3, final=1)
+        conn.wait_for_save()
+        conn.connector_worker.note_device_saves.assert_called_once()
+        conn.connector_worker.save_kv_to_host.assert_not_called()
+        # Nothing saved this step: nothing to note.
+        conn.connector_worker.reset_mock()
+        conn._connector_metadata = NixlConnectorMetadata()
+        conn.wait_for_save()
+        conn.connector_worker.note_device_saves.assert_not_called()
+
+    def test_scheduler_tracks_p_requests_without_host_buffer(self):
+        sched = make_nixl_push_scheduler(early_push=True)
+        sched.use_host_buffer = False
+        req = _p_save_request("req-p", 64)
+        req.kv_transfer_params = {"do_remote_decode": True}
+        sched.update_state_after_alloc(req, MagicMock(), 0)
+        assert sched._reqs_need_save["req-p"] is req
+
+
 @pytest.mark.parametrize("asynchronous", [True, False])
 def test_save_kv_to_host_returns_copy_op_handles(asynchronous):
     """An asynchronous copy op's handles come back per request; a synchronous
