@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import concurrent.futures
 import contextlib
 import errno
 import socket
@@ -20,6 +21,7 @@ import zmq.asyncio
 from tests.v1.attention.utils import dense_kv_cache_views
 from vllm import envs
 from vllm.config import KVTransferConfig, set_current_vllm_config
+from vllm.distributed.kv_transfer.kv_connector.utils import allocate_host_mirrors
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     mooncake_connector,
     mooncake_utils,
@@ -1245,9 +1247,13 @@ def _xfer_meta(
 
 
 @contextlib.contextmanager
-def mooncake_register_worker(kv_cache_config, *, kv_role: str = "kv_consumer"):
+def mooncake_register_worker(
+    kv_cache_config, *, kv_role: str = "kv_consumer", kv_buffer_device=None
+):
     """Build a worker whose engine registration and sender thread are patched."""
     vllm_config = _make_worker_vllm_config(kv_role)
+    if kv_buffer_device is not None:
+        vllm_config.kv_transfer_config.kv_buffer_device = kv_buffer_device
     connector_mod = (
         "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector"
     )
@@ -1625,6 +1631,7 @@ def test_pull_completion_requires_local_blocks(
     worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
     worker.shutdown = MagicMock()
     worker.finished_recving_reqs = set()
+    worker.use_host_buffer = False
     pull_meta = PullReqMeta(
         d_req_id="d-req-1",
         transfer_id="xfer-req-1",
@@ -3444,3 +3451,189 @@ def test_sleep_unregisters_and_restores_kv_caches():
         worker.restore_kv_caches()
         worker.restore_kv_caches()
         reg.assert_called_once_with([raw.data_ptr()], [raw.nbytes])
+
+
+def test_allocate_host_mirrors_keeps_layout_and_storage_sharing():
+    raw = torch.zeros(4, 2, 8, dtype=torch.float16)
+    caches = {
+        "k": raw[:, 0],
+        "v": raw[:, 1],
+        "meta0": torch.empty(4, 8, dtype=torch.bfloat16, device="meta"),
+        "meta1": torch.empty(4, 8, dtype=torch.bfloat16, device="meta"),
+    }
+    mirrors = allocate_host_mirrors(caches)
+    for name, cache in caches.items():
+        mirror = mirrors[name]
+        assert mirror.device.type == "cpu"
+        assert (mirror.shape, mirror.stride(), mirror.dtype) == (
+            cache.shape,
+            cache.stride(),
+            cache.dtype,
+        )
+        assert mirror.storage_offset() == cache.storage_offset()
+
+    def storage(name):
+        return mirrors[name].untyped_storage().data_ptr()
+
+    assert storage("k") == storage("v")
+    # Storage-free caches (address 0) never share a mirror.
+    assert len({storage("k"), storage("meta0"), storage("meta1")}) == 3
+
+
+class _NoAddressCache(torch.Tensor):
+    """A cache whose storage has no readable address, as out-of-tree device
+    runtimes expose their KV caches to connectors."""
+
+    @staticmethod
+    def __new__(cls, size, dtype):
+        return torch.Tensor._make_wrapper_subclass(cls, size, dtype=dtype)
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        raise NotImplementedError(func)
+
+
+def test_allocate_host_mirrors_accepts_caches_without_an_address():
+    caches = {n: _NoAddressCache((4, 8), torch.bfloat16) for n in ("a", "b")}
+    with pytest.raises(RuntimeError):
+        caches["a"].untyped_storage().data_ptr()
+    mirrors = allocate_host_mirrors(caches)
+    assert all(
+        m.shape == (4, 8) and m.dtype == torch.bfloat16 for m in mirrors.values()
+    )
+    assert (
+        mirrors["a"].untyped_storage().data_ptr()
+        != mirrors["b"].untyped_storage().data_ptr()
+    )
+
+
+@contextlib.contextmanager
+def _host_buffer_worker(monkeypatch, kv_role: str):
+    """A worker on a non-CUDA platform with kv_buffer_device="cpu", its device
+    caches storage-free, and a recording copy op."""
+
+    def no_accelerator():
+        raise AssertionError("host-buffer mode must not bind an accelerator")
+
+    monkeypatch.setattr(mooncake_connector.current_platform, "device_type", "fake")
+    monkeypatch.setattr(torch.accelerator, "current_device_index", no_accelerator)
+    spec = FullAttentionSpec(
+        block_size=maybe_update_block_size(16),
+        num_kv_heads=4,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    names = ["model.layers.0.self_attn", "model.layers.1.self_attn"]
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(names, spec)],
+    )
+    with mooncake_register_worker(
+        kv_cache_config, kv_role=kv_role, kv_buffer_device="cpu"
+    ) as (worker, reg):
+        assert worker.use_host_buffer
+        events: list = []
+        worker.set_host_xfer_buffer_ops(
+            lambda src, dst, src_ids, dst_ids, direction: events.append(
+                (direction, src, dst, list(src_ids), list(dst_ids))
+            )
+        )
+        kv_caches = {
+            name: torch.empty(
+                8, spec.block_size, 4, 2 * 64, dtype=torch.float16, device="meta"
+            )
+            for name in names
+        }
+        worker.register_kv_caches(kv_caches)
+        yield worker, reg, kv_caches, events
+        worker.shutdown()
+        # __del__ would shut down again outside the patched dependencies.
+        worker.shutdown = MagicMock()
+
+
+def _run_now(coro, loop):
+    fut: concurrent.futures.Future = concurrent.futures.Future()
+    fut.set_result(asyncio.run(coro))
+    return fut
+
+
+def test_host_buffer_registers_host_mirrors(monkeypatch):
+    with _host_buffer_worker(monkeypatch, "kv_consumer") as (worker, reg, caches, _):
+        mirrors = worker.host_xfer_buffers
+        assert set(mirrors) == set(caches)
+        registered_ptrs, registered_lens = reg.call_args[0]
+        assert registered_ptrs == [
+            m.untyped_storage().data_ptr() for m in mirrors.values()
+        ]
+        assert registered_lens == [
+            m.untyped_storage().nbytes() for m in mirrors.values()
+        ]
+        assert worker.kv_caches_base_addr == [m.data_ptr() for m in mirrors.values()]
+        assert worker.device_kv_caches is caches
+
+
+def test_host_buffer_producer_copies_to_host_before_send(monkeypatch):
+    with _host_buffer_worker(monkeypatch, "kv_producer") as (worker, _, caches, events):
+        scheduled = MagicMock(side_effect=lambda coro, loop: coro.close())
+        monkeypatch.setattr(
+            mooncake_connector.asyncio, "run_coroutine_threadsafe", scheduled
+        )
+        monkeypatch.setattr(
+            worker,
+            "record_send_reqs",
+            lambda metadata: events.append(("ready",)) or asyncio.sleep(0),
+        )
+        metadata = MooncakeConnectorMetadata()
+        metadata.add_new_req(
+            "p-req", [[0, 3, 5]], {"transfer_id": "x"}, load_remote_cache=False
+        )
+        worker.start_load_kv(metadata)
+
+        ((direction, src, dst, src_ids, dst_ids), ready) = events
+        assert ready == ("ready",)
+        assert direction == "d2h"
+        assert set(src) == set(caches) and all(src[n] is caches[n] for n in caches)
+        assert all(dst[n] is worker.host_xfer_buffers[n] for n in caches)
+        # The null block is a placeholder and is never copied.
+        assert src_ids == dst_ids == [3, 5]
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_host_buffer_consumer_copies_to_device_before_reporting(monkeypatch, failed):
+    with _host_buffer_worker(monkeypatch, "kv_consumer") as (worker, _, caches, events):
+        monkeypatch.setattr(
+            mooncake_connector.asyncio, "run_coroutine_threadsafe", _run_now
+        )
+        pull_meta = PullReqMeta(
+            d_req_id="d-req",
+            transfer_id="x",
+            local_block_ids=[[2, 6]],
+            remote_engine_id="p-engine",
+            remote_bootstrap_addr="http://bootstrap:33333",
+            pull_tasks_count=1,
+            failed=failed,
+        )
+        worker._complete_pull_task(pull_meta)
+        assert events == []
+
+        _, finished_recving = worker.get_finished()
+
+        assert finished_recving == {"d-req"}
+        if failed:
+            assert events == []
+        else:
+            ((direction, src, dst, src_ids, _),) = events
+            assert direction == "h2d"
+            assert all(src[n] is worker.host_xfer_buffers[n] for n in caches)
+            assert all(dst[n] is caches[n] for n in caches)
+            assert src_ids == [2, 6]
+        assert worker.get_finished() == (None, None)
+        assert len(events) == (0 if failed else 1)
+
+
+def test_host_buffer_without_copy_op_fails_clearly(monkeypatch):
+    with _host_buffer_worker(monkeypatch, "kv_producer") as (worker, *_):
+        worker.copy_blocks = None
+        with pytest.raises(RuntimeError, match="set_host_xfer_buffer_ops"):
+            worker._copy_host_blocks([[1]], "d2h")

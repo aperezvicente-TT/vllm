@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineTransferInfo,
     TransferTopology,
     check_compressed_kernel_split,
+    copy_blocks_by_group,
     get_current_attn_backends,
     get_current_attn_backends_and_specs,
     kv_postprocess_blksize_and_layout_on_receive,
@@ -3026,18 +3027,14 @@ class NixlBaseConnectorWorker:
         local_block_ids = meta.local_physical_block_ids
         # The h2d block copies below are intentionally synchronous.
         with gpu_sync_allowed():
-            # NIXL fills each layer's host buffer only at its own group's
-            # blocks, and layers of different groups share device tensors.
-            for group, block_ids in zip(
-                self.kv_cache_config.transfer_groups, local_block_ids
-            ):
-                self.copy_blocks(
-                    {n: self.host_xfer_buffers[n] for n in group.layer_names},
-                    {n: self.device_kv_caches[n] for n in group.layer_names},
-                    block_ids,
-                    block_ids,
-                    "h2d",
-                )
+            copy_blocks_by_group(
+                self.copy_blocks,
+                self.host_xfer_buffers,
+                self.device_kv_caches,
+                self.kv_cache_config,
+                local_block_ids,
+                "h2d",
+            )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "synced recved kv of request[%s] to device kv buffer,"

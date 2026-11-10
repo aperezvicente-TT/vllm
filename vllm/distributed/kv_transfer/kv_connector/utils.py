@@ -3,7 +3,7 @@
 """KV cache helper for store."""
 
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -279,6 +279,62 @@ def copy_kv_blocks(
         src_tensor = src_kv_caches[layer_name]
         dst_tensor = dst_kv_caches[layer_name]
         copy_fn(src_tensor, dst_tensor, src_indices, dst_indices)
+
+
+def allocate_host_mirrors(
+    kv_caches: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Host tensors with the size, strides, dtype and storage sharing of each
+    KV cache, for connectors that stage KV in host memory
+    (`kv_buffer_device="cpu"`). Registering the mirrors with a transport gives
+    it the device caches' layout; blocks move between the two through the
+    platform's copy op (`set_host_xfer_buffer_ops`).
+
+    Caches that share storage share a mirror. Caches without an address (e.g.
+    on a platform whose KV is not host-addressable, where the caches are meta
+    or wrapper-subclass tensors) get one each.
+    """
+    storages: dict[int, torch.Tensor] = {}
+    mirrors: dict[str, torch.Tensor] = {}
+    for name, cache in kv_caches.items():
+        storage = cache.untyped_storage()
+        try:
+            address = storage.data_ptr()
+        except RuntimeError:
+            address = 0
+        key = address or id(cache)
+        base = storages.get(key)
+        if base is None:
+            base = torch.empty(storage.nbytes(), dtype=torch.uint8)
+            storages[key] = base
+        mirrors[name] = base.view(cache.dtype).as_strided(
+            cache.size(), cache.stride(), cache.storage_offset()
+        )
+    return mirrors
+
+
+def copy_blocks_by_group(
+    copy_blocks: Callable[..., None],
+    src_kv_caches: dict[str, torch.Tensor],
+    dst_kv_caches: dict[str, torch.Tensor],
+    kv_cache_config: KVCacheConfig,
+    block_ids: BlockIds,
+    direction: Literal["h2d", "d2h"],
+) -> None:
+    """Copy each transfer group's blocks between two cache sets with a
+    `CopyBlocksOp`. Block ids are per group: layers of different groups can
+    share a tensor, so each group's ids apply to its own layers only."""
+    for group, group_block_ids in zip(kv_cache_config.transfer_groups, block_ids):
+        if not group_block_ids:
+            continue
+        names = [n for n in group.layer_names if n in src_kv_caches]
+        copy_blocks(
+            {n: src_kv_caches[n] for n in names},
+            {n: dst_kv_caches[n] for n in names},
+            group_block_ids,
+            group_block_ids,
+            direction,
+        )
 
 
 def kv_postprocess_blksize_on_receive(cache, indices, block_size_ratio):
