@@ -189,6 +189,10 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
         # Early push (see module docstring).
         # Main thread: saves of prefilling requests, by P request id.
         self._early_saves: dict[ReqId, _EarlySaves] = {}
+        # Main thread: prefilling requests whose saves give no completion to
+        # rely on (a failed save, or a copy op that returned no handle and is
+        # not declared synchronous); their blocks all go with the final WRITE.
+        self._early_off: set[ReqId] = set()
         # Main thread -> writer: (req_id, prompt blocks, [(position, block)]).
         self._early_blocks_inbox: queue.Queue[
             tuple[str, int, list[tuple[int, int]]]
@@ -339,6 +343,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 # Every save of a finished request has landed: hand the rest
                 # to the final WRITE.
                 self._early_saves.pop(req_id, None)
+                self._early_off.discard(req_id)
                 self._finished_blocks_inbox.put((req_id, block_ids))
             self._push_writer_wake.set()
 
@@ -350,6 +355,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             assert req_id not in self._reqs_to_send
             # Aborted on P: D must not wait for a push that never completes.
             self._early_saves.pop(req_id, None)
+            self._early_off.discard(req_id)
             self._early_abort_inbox.put(req_id)
             self._push_writer_wake.set()
         # Rebase scheduler-clock deadlines onto this worker's clock — see the
@@ -917,8 +923,20 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
 
     def save_kv_to_host(self, metadata: NixlConnectorMetadata) -> dict[ReqId, list]:
         handles = super().save_kv_to_host(metadata)
+        synchronous = getattr(self.copy_blocks, "synchronous", False)
         for req_id, meta in metadata.reqs_to_save.items():
             saves = self._early_saves.get(req_id)
+            if req_id in self._early_off:
+                if meta.push_last_save:
+                    self._early_off.discard(req_id)
+                continue
+            if meta.push_total_blocks > 0 and not handles.get(req_id) and not synchronous:
+                # Nothing says when this save lands: WRITEing early could send
+                # stale host bytes. Blocks already handed over were saved.
+                self._early_saves.pop(req_id, None)
+                if not meta.push_last_save:
+                    self._early_off.add(req_id)
+                continue
             if meta.push_total_blocks <= 0:
                 if saves is not None:
                     # The scheduler stopped early push for this request (its
@@ -954,6 +972,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 # raises; here, just stop pushing this request early.
                 logger.warning("Early push of %s stopped: save failed (%s)", req_id, e)
                 del self._early_saves[req_id]
+                self._early_off.add(req_id)
                 continue
             # The prompt's last block always goes with the final WRITE, which
             # therefore never has an empty block list.

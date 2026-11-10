@@ -32,7 +32,10 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import pytest
 
-from vllm.distributed.kv_transfer.kv_connector.utils import TransferTopology
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    TransferTopology,
+    copy_kv_blocks,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
 )
@@ -360,6 +363,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._evict_finished_inbox = queue.Queue()
         w._deferred_push_inbox = queue.Queue()
         w._early_saves = {}
+        w._early_off = set()
         w._early_blocks_inbox = queue.Queue()
         w._early_abort_inbox = queue.Queue()
         w._early_pushes = {}
@@ -2393,11 +2397,46 @@ class TestEarlyPushSaves:
 
     def test_synchronous_copy_op_hands_blocks_immediately(self):
         w = _EarlyWorker.make()
+        w.copy_blocks = copy_kv_blocks  # declared synchronous
         with patch.object(
             NixlBaseConnectorWorker, "save_kv_to_host", new=lambda s, m: {}
         ):
             w.save_kv_to_host(_save_meta("req-p", [10, 11], total=4, final=2))
         assert w._early_blocks_inbox.get_nowait() == ("req-p", 4, [(0, 10), (1, 11)])
+
+    def test_copy_op_without_handles_or_declaration_is_not_pushed_early(self):
+        """An asynchronous op that returns None gives no completion: none of
+        the request's blocks are WRITTEN early, also not those of later chunks,
+        and its saves are not taken as done (all([]) on no handles)."""
+        w = _EarlyWorker.make()
+        w.copy_blocks = lambda *args: None  # not declared synchronous
+        handles: dict = {}
+        with patch.object(
+            NixlBaseConnectorWorker, "save_kv_to_host", new=lambda s, m: handles
+        ):
+            w.save_kv_to_host(_save_meta("req-p", [10, 11], total=6, final=2))
+            assert w._early_blocks_inbox.empty() and "req-p" not in w._early_saves
+            # A later chunk with a handle does not restart tracking mid-prompt.
+            handles["req-p"] = [_Handle(True)]
+            w.save_kv_to_host(_save_meta("req-p", [12, 13], total=6, final=4))
+            w._poll_early_saves()
+            assert w._early_blocks_inbox.empty() and "req-p" not in w._early_saves
+            w.save_kv_to_host(
+                _save_meta("req-p", [14, 15], total=6, final=6, last=True)
+            )
+        assert "req-p" not in w._early_off
+
+    def test_failed_save_does_not_restart_tracking(self):
+        w, save = self._worker()
+        with patch.object(
+            NixlBaseConnectorWorker, "save_kv_to_host", new=lambda s, m: save(m)
+        ):
+            w.save_kv_to_host(_save_meta("req-p", [10], total=4, final=1))
+            w.saved[0].error = RuntimeError("copy failed")
+            w._poll_early_saves()
+            w.next_done = True
+            w.save_kv_to_host(_save_meta("req-p", [11], total=4, final=2))
+        assert w._early_blocks_inbox.empty() and "req-p" not in w._early_saves
 
     def test_failed_save_stops_early_push(self):
         w, save = self._worker()

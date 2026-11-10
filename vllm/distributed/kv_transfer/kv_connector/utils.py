@@ -267,6 +267,10 @@ def copy_kv_blocks(
         copy_fn(src_tensor, dst_tensor, src_indices, dst_indices)
 
 
+# Each call completes before returning (see `CopyBlocksOp`).
+copy_kv_blocks.synchronous = True  # type: ignore[attr-defined]
+
+
 def kv_postprocess_blksize_on_receive(cache, indices, block_size_ratio):
     """Transforms the layout of received KV cache blocks to the local block_size.
     (Only works for local blocksize > remote blocksize)
