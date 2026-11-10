@@ -1107,3 +1107,65 @@ def test_decode_bench_connector_startup_fill_keeps_circular_buffer_zero_fill():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("startup_fill", [False, True])
+def test_decode_bench_connector_fills_through_host_copy_op(monkeypatch, startup_fill):
+    """With kv_buffer_device="cpu" on an accelerator, fills go to host copies of
+    the caches and reach the device through the platform's copy op, so caches
+    without torch-writable storage can be filled."""
+    monkeypatch.setattr(current_platform, "device_type", "fake")
+    vllm_config = create_vllm_config(
+        block_size=16,
+        kv_connector="DecodeBenchConnector",
+        kv_connector_extra_config={"startup_fill": startup_fill},
+    )
+    vllm_config.kv_transfer_config.kv_buffer_device = "cpu"
+    names = ["layer.0", "layer.1"]
+    kv_cache_config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                names,
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+        ],
+    )
+    connector = DecodeBenchConnector(
+        vllm_config, KVConnectorRole.WORKER, kv_cache_config
+    )
+    caches = {name: torch.empty(4, 2, 16, device="meta") for name in names}
+    device = {name: torch.full((4, 2, 16), -1.0) for name in names}
+    copies = []
+
+    def copy_op(src, dst, src_ids, dst_ids, direction):
+        assert direction == "h2d" and src_ids == dst_ids
+        assert all(dst[n] is caches[n] for n in dst)
+        copies.append(list(src_ids))
+        for name, host in src.items():
+            assert host.device.type == "cpu"
+            device[name][dst_ids] = host[src_ids]
+
+    connector.register_kv_caches(caches)
+    connector.set_host_xfer_buffer_ops(copy_op)
+    assert copies == []
+
+    worker = connector.connector_worker
+    assert worker is not None
+    reqs = {} if startup_fill else {"r": (([1, 3],), 20)}
+    worker.start_fill_kv(DecodeBenchConnectorMetadata(reqs_to_fill=reqs))
+
+    filled = [0, 1, 2, 3] if startup_fill else [1, 3]
+    assert copies == [filled]
+    for name in names:
+        for block in range(4):
+            expected = 0.015 if block in filled else -1.0
+            torch.testing.assert_close(
+                device[name][block], torch.full((2, 16), expected)
+            )
+
+    worker.start_fill_kv(DecodeBenchConnectorMetadata(reqs_to_fill={}))
+    assert copies == [filled]

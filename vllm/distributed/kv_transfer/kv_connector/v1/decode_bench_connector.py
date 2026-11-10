@@ -36,13 +36,18 @@ Example:
           filled per request. The fill is not redone after sleep mode
           discards the KV cache.
 
+    With `"kv_buffer_device": "cpu"` on an accelerator, the values are written
+    into host copies of the KV caches and moved to the device with the
+    platform's block copy op (`set_host_xfer_buffer_ops`), for platforms whose
+    KV caches cannot be written from torch.
+
     The dummy KV cache is only meant for performance measurement; outputs are
     not meaningful for accuracy evaluation.
 
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -51,6 +56,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    CopyBlocksOp,
     KVConnectorMetadata,
     SupportsHMA,
 )
@@ -170,6 +176,10 @@ class DecodeBenchConnector(KVConnectorBase_V1, SupportsHMA):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
+
+    def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
+        assert self.connector_worker is not None
+        self.connector_worker.set_host_xfer_buffer_ops(copy_operation)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         assert self.connector_worker is not None
@@ -429,6 +439,16 @@ class DecodeBenchConnectorWorker:
         # Will be populated via register_kv_caches
         self.kv_caches: dict[str, torch.Tensor] | None = None
 
+        # Host-buffer mode: kv_caches are host copies of device_kv_caches, and
+        # every fill is followed by a copy of the filled blocks to the device.
+        self.use_host_buffer = (
+            kv_transfer_config.kv_buffer_device == "cpu"
+            and current_platform.device_type != "cpu"
+        )
+        self.device_kv_caches: dict[str, torch.Tensor] = {}
+        self.copy_blocks: CopyBlocksOp | None = None
+        self._pending_startup_copy = False
+
         # Layers whose uint8 KV cache stores plain fp8 values
         self._fp8_dtypes: dict[str, torch.dtype] = {}
         for group in kv_cache_config.kv_cache_groups:
@@ -467,6 +487,17 @@ class DecodeBenchConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Store references to the KV cache tensors."""
+        if self.use_host_buffer:
+            self.device_kv_caches = {
+                name: cache
+                for name, cache in kv_caches.items()
+                if isinstance(cache, torch.Tensor)
+            }
+            kv_caches = {
+                name: torch.empty_like(cache, device="cpu")
+                for name, cache in self.device_kv_caches.items()
+            }
+            self._pending_startup_copy = self.startup_fill
         self.kv_caches = kv_caches
 
         logger.debug(
@@ -516,6 +547,34 @@ class DecodeBenchConnectorWorker:
             self.fill_std,
         )
 
+    def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
+        if self.use_host_buffer:
+            self.copy_blocks = copy_operation
+
+    def _copy_to_device(self, group_idx: int, block_ids: list[int] | None) -> None:
+        """Copy a group's filled host blocks (None: all of them) to the device."""
+        if self.copy_blocks is None:
+            raise RuntimeError(
+                "DecodeBenchConnector with kv_buffer_device='cpu' needs the "
+                "platform's host copy op (set_host_xfer_buffer_ops)."
+            )
+        assert self.kv_caches is not None
+        names = [
+            n for n in self.group_to_layers.get(group_idx, []) if n in self.kv_caches
+        ]
+        if not names:
+            return
+        if block_ids is None:
+            block_ids = list(range(self.kv_caches[names[0]].shape[0]))
+        direction: Literal["h2d"] = "h2d"
+        self.copy_blocks(
+            {n: self.kv_caches[n] for n in names},
+            {n: self.device_kv_caches[n] for n in names},
+            block_ids,
+            block_ids,
+            direction,
+        )
+
     def start_fill_kv(self, metadata: DecodeBenchConnectorMetadata):
         """Fill the allocated KV cache blocks with dummy values.
 
@@ -524,6 +583,11 @@ class DecodeBenchConnectorWorker:
 
         Supports both single- and multi-group KV cache configurations.
         """
+        if self._pending_startup_copy:
+            # The copy op arrives after registration, where the startup fill ran.
+            self._pending_startup_copy = False
+            for group_idx in sorted(self._startup_fill_group_ids):
+                self._copy_to_device(group_idx, None)
         if not metadata.reqs_to_fill:
             return
 
@@ -533,6 +597,8 @@ class DecodeBenchConnectorWorker:
             # Fill blocks for each KV cache group
             for group_idx, block_ids in enumerate(block_ids_per_group):
                 self._fill_blocks(group_idx, block_ids, num_tokens)
+                if self.use_host_buffer and block_ids:
+                    self._copy_to_device(group_idx, block_ids)
 
             block_counts = tuple(len(group) for group in block_ids_per_group)
             logger.debug(
