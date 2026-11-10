@@ -304,6 +304,8 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:
             self.connector_worker.save_kv_to_host(self._connector_metadata)
+        elif self._connector_metadata.reqs_to_save:
+            self.connector_worker.note_device_saves(self._connector_metadata)
 
     def has_pending_push_work(self) -> bool:
         if self.connector_scheduler is not None:
