@@ -10,7 +10,7 @@ from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import msgspec
 import numpy as np
@@ -24,9 +24,12 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     TransferTopology,
+    allocate_host_mirrors,
+    copy_blocks_by_group,
     get_current_attn_backends,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    CopyBlocksOp,
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
@@ -583,6 +586,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
+    def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
+        assert self.connector_worker is not None
+        self.connector_worker.set_host_xfer_buffer_ops(copy_operation)
+
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
@@ -947,15 +954,29 @@ class MooncakeConnectorWorker:
         logger.info("Initializing Mooncake Transfer Engine worker %s", engine_id)
 
         self.vllm_config = vllm_config
-        # Capture device BEFORE TransferEngine init — MNNVL's NVLink allocator
-        # may change the current CUDA device during engine.initialize().
-        self.device_id = torch.accelerator.current_device_index()
-        current_platform.set_device(self.device_id)
+        assert (kv_transfer_config := vllm_config.kv_transfer_config)
+        # kv_buffer_device="cpu" on an accelerator: Mooncake moves host
+        # mirrors of the KV caches, and the platform's copy op
+        # (set_host_xfer_buffer_ops) moves blocks between them and the device.
+        self.use_host_buffer = (
+            kv_transfer_config.kv_buffer_device == "cpu"
+            and current_platform.device_type != "cpu"
+        )
+        self.host_xfer_buffers: dict[str, torch.Tensor] = {}
+        self.copy_blocks: CopyBlocksOp | None = None
+        # D side: local blocks of pulls that completed, until copied to device.
+        self._recved_block_ids: dict[ReqId, list[list[int]]] = {}
+        self.device_id = 0
+        if not self.use_host_buffer:
+            # Capture device BEFORE TransferEngine init — MNNVL's NVLink
+            # allocator may change the current CUDA device during
+            # engine.initialize().
+            self.device_id = torch.accelerator.current_device_index()
+            current_platform.set_device(self.device_id)
 
         self.engine = TransferEngine()
         self.hostname = get_ip()
 
-        assert (kv_transfer_config := vllm_config.kv_transfer_config)
         self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer"
         self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer"
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
@@ -1692,7 +1713,8 @@ class MooncakeConnectorWorker:
         """ThreadPoolExecutor initializer — binds each pool thread to the
         correct CUDA device.  CUDA device selection is thread-local, so
         without this, NVLink transfers fail for TP ranks > 0."""
-        current_platform.set_device(self.device_id)
+        if not self.use_host_buffer:
+            current_platform.set_device(self.device_id)
 
     def _send_blocks(
         self,
@@ -1727,7 +1749,15 @@ class MooncakeConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
-        logger.info("Registering KV_Caches. use_mla: %s", self.use_mla)
+        logger.info(
+            "Registering KV_Caches. use_mla: %s, use_host_buffer: %s",
+            self.use_mla,
+            self.use_host_buffer,
+        )
+        device_kv_caches = kv_caches
+        if self.use_host_buffer:
+            self.host_xfer_buffers = allocate_host_mirrors(kv_caches)
+            kv_caches = self.host_xfer_buffers
 
         kv_data_ptrs: list[int] = []
         kv_data_lens: list[int] = []
@@ -1811,7 +1841,7 @@ class MooncakeConnectorWorker:
         if ret_value != 0:
             raise RuntimeError("Mooncake batch memory registration failed.")
 
-        self.device_kv_caches = kv_caches
+        self.device_kv_caches = device_kv_caches
         logger.debug(
             "registered block_lens=%s kv_block_lens=%s",
             self.block_len_per_layer,
@@ -1846,10 +1876,40 @@ class MooncakeConnectorWorker:
                     f"{ready_timeout:.0f}s."
                 )
 
-    async def fetch_finished_recving_reqs(self) -> set[ReqId]:
+    def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
+        if self.use_host_buffer:
+            self.copy_blocks = copy_operation
+
+    def _copy_host_blocks(
+        self, block_ids: list[list[int]], direction: Literal["h2d", "d2h"]
+    ) -> None:
+        if self.copy_blocks is None:
+            raise RuntimeError(
+                "MooncakeConnector with kv_buffer_device='cpu' needs the "
+                "platform's host copy op (set_host_xfer_buffer_ops)."
+            )
+        src, dst = self.device_kv_caches, self.host_xfer_buffers
+        if direction == "h2d":
+            src, dst = dst, src
+        # Null blocks are Mamba align-mode placeholders, never transferred.
+        block_ids = [[b for b in group if b != NULL_BLOCK_ID] for group in block_ids]
+        copy_blocks_by_group(
+            self.copy_blocks,
+            src,
+            dst,
+            self.kv_cache_config,
+            self._logical_to_kernel_block_ids(block_ids),
+            direction,
+        )
+
+    async def fetch_finished_recving_reqs(
+        self,
+    ) -> tuple[set[ReqId], dict[ReqId, list[list[int]]]]:
         finished_recving_reqs = self.finished_recving_reqs
         self.finished_recving_reqs = set()
-        return finished_recving_reqs
+        recved_block_ids = self._recved_block_ids
+        self._recved_block_ids = {}
+        return finished_recving_reqs, recved_block_ids
 
     async def fetch_finished_sending_reqs(self) -> set[ReqId]:
         finished_sending_reqs = self.finished_sending_reqs
@@ -1897,8 +1957,14 @@ class MooncakeConnectorWorker:
                 self.fetch_finished_sending_reqs(), self.sender_loop
             )
 
-        finished_recving_reqs = recv_fut.result() if recv_fut else set()
+        finished_recving_reqs, recved_block_ids = (
+            recv_fut.result() if recv_fut else (set(), {})
+        )
         finished_sending_reqs = send_fut.result() if send_fut else set()
+        # Received KV is in the host mirrors; it must reach the device before
+        # the scheduler learns the load is done.
+        for block_ids in recved_block_ids.values():
+            self._copy_host_blocks(block_ids, "h2d")
 
         if finished_sending_reqs or finished_recving_reqs:
             logger.debug(
@@ -2059,6 +2125,10 @@ class MooncakeConnectorWorker:
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
+                if self.use_host_buffer and any(pull_meta.local_block_ids):
+                    self._recved_block_ids[pull_meta.d_req_id] = (
+                        pull_meta.local_block_ids
+                    )
                 self.finished_recving_reqs.add(pull_meta.d_req_id)
 
         if ok_reqs:
@@ -2202,6 +2272,11 @@ class MooncakeConnectorWorker:
         if not self.is_kv_consumer and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
+            if self.use_host_buffer:
+                # Before record_send_reqs marks the blocks ready to send.
+                for _, block_ids in metadata.reqs_to_send.values():
+                    if any(block_ids):
+                        self._copy_host_blocks(block_ids, "d2h")
             asyncio.run_coroutine_threadsafe(
                 self.record_send_reqs(metadata), self.sender_loop
             )
