@@ -247,7 +247,11 @@ def allocate_host_mirrors(
     mirrors: dict[str, torch.Tensor] = {}
     for name, cache in kv_caches.items():
         storage = cache.untyped_storage()
-        key = storage.data_ptr() or id(cache)
+        try:
+            address = storage.data_ptr()
+        except RuntimeError:
+            address = 0
+        key = address or id(cache)
         base = storages.get(key)
         if base is None:
             base = torch.empty(storage.nbytes(), dtype=torch.uint8)
