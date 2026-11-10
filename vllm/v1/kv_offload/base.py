@@ -647,6 +647,10 @@ class CanonicalKVCacheRef:
     page_size_bytes: int
     # How this worker's page maps into a canonical page; None = uncertified
     mapping: CanonicalPageMapping | None = None
+    # The layer this reference describes; None when it covers several layers
+    # (packed layouts). Lets a worker that does not move KV by address
+    # (Platform.get_offloading_worker_cls) find the layer's cache.
+    layer_name: str | None = field(default=None, compare=False)
 
 
 @dataclass

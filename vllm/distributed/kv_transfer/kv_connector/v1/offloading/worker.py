@@ -168,10 +168,17 @@ class OffloadingConnectorWorker:
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
         # Layers that alias the same bytes (cache groups overlay each other) share
         # one transfer region: exactly the views with equal address and strides.
-        aliased_layers: dict[tuple[int, tuple[int, ...]], list[str]] = defaultdict(list)
+        # Caches without storage (address 0, e.g. on a platform whose KV is not
+        # host-addressable and is moved by its own offloading worker) never alias.
+        aliased_layers: dict[tuple, list[str]] = defaultdict(list)
         for layer_name, layer_tensors in tensors_per_block.items():
             view = layer_tensors[0]
-            aliased_layers[(view.data_ptr(), view.stride())].append(layer_name)
+            key = (
+                (view.data_ptr(), view.stride())
+                if view.data_ptr() != 0
+                else (layer_name,)
+            )
+            aliased_layers[key].append(layer_name)
 
         for tensor_layer_names in aliased_layers.values():
             assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
@@ -202,6 +209,7 @@ class OffloadingConnectorWorker:
                             tensor_idx=curr_tensor_idx,
                             page_size_bytes=(unpadded_page_size_bytes[layer_name]),
                             mapping=mapping,
+                            layer_name=layer_name,
                         )
                     )
 

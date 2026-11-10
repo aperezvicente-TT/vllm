@@ -3,7 +3,9 @@
 This guide covers configuration of the [`OffloadingConnector`](disagg_prefill.md), which extends the prefix cache by offloading completed KV blocks to slower but larger tiers (CPU host memory, plus optional secondary tiers) as they are produced. Hits in the offload tiers are promoted back to GPU on demand. Transfers between GPU and CPU use DMA (`cudaMemcpyAsync`) and run asynchronously alongside model computation, so offloading adds minimal CPU- and GPU-core overhead.
 
 !!! note
-    The `OffloadingConnector` currently supports CUDA, ROCm, and XPU only.
+    The `OffloadingConnector` currently supports CUDA, ROCm, and XPU, and out-of-tree
+    platforms that supply their own CPU-tier worker through
+    `Platform.get_offloading_worker_cls()`.
 
 ## Overview
 

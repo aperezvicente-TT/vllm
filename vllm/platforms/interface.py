@@ -1472,6 +1472,21 @@ class Platform:
         return None
 
     @classmethod
+    def get_offloading_worker_cls(cls) -> str | None:
+        """Qualified name of the worker that moves KV blocks between the
+        device and the CPU tier of the OffloadingConnector, or None for the
+        built-in worker (CUDA-alike and XPU only).
+
+        The class subclasses ``vllm.v1.kv_offload.base.OffloadingWorker`` and
+        is constructed with the built-in worker's keyword arguments
+        (``kv_caches``, ``blocks_per_chunk``, ``num_cpu_chunks``,
+        ``mmap_region``, ``canonical_layout``). When ``mmap_region`` is given
+        (always for ``TieringOffloadingSpec``), the worker must keep its CPU
+        blocks in its slot of that region, where the secondary tiers read them.
+        """
+        return None
+
+    @classmethod
     def check_max_model_len(cls, max_model_len: int) -> int:
         """Check max_model_len for the current platform."""
         return max_model_len

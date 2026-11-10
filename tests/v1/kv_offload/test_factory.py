@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
 from tests.v1.kv_offload.conftest import make_offloading_config
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
@@ -388,7 +389,7 @@ def test_tiering_spec_create_worker_uses_single_slot_for_replicated_layout(monke
         return MagicMock()
 
     monkeypatch.setattr(tiering_spec_module, "SharedOffloadRegion", fake_region_ctor)
-    monkeypatch.setattr(tiering_spec_module, "CPUOffloadingWorker", fake_worker_ctor)
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", fake_worker_ctor)
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 5)
 
     kv_caches = MagicMock()
@@ -418,7 +419,7 @@ def test_tiering_spec_create_worker_uses_worker_rank_for_sharded_layout(monkeypa
         return MagicMock()
 
     monkeypatch.setattr(tiering_spec_module, "SharedOffloadRegion", fake_region_ctor)
-    monkeypatch.setattr(tiering_spec_module, "CPUOffloadingWorker", MagicMock())
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
     monkeypatch.setattr(
         torch.accelerator,
         "current_device_index",
@@ -810,7 +811,7 @@ def test_tiering_spec_rejects_secondary_tiers_across_nodes(
     region_ctor = MagicMock()
     worker_ctor = MagicMock()
     monkeypatch.setattr(tiering_spec_module, "SharedOffloadRegion", region_ctor)
-    monkeypatch.setattr(tiering_spec_module, "CPUOffloadingWorker", worker_ctor)
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", worker_ctor)
 
     if rejected:
         with pytest.raises(NotImplementedError, match="span several nodes"):

@@ -64,11 +64,11 @@ from vllm.v1.kv_offload.base import (
     OffloadingHistogramMetadata,
     OffloadingManager,
     OffloadingMetricMetadata,
+    OffloadingWorker,
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
-from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec, offloading_worker_cls
 from vllm.v1.kv_offload.tiering.base import (
     TIER_LABEL,
     SecondaryTierManager,
@@ -539,7 +539,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         return True
 
     @override
-    def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
+    def create_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        worker_cls = offloading_worker_cls()
         if self.secondary_tier_configs and self.config.parallel.world_size > 1:
             _reject_workers_across_nodes()
         rank = 0 if self.replicated_layout else self.config.parallel.rank
@@ -553,7 +554,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         try:
             if self.config.canonical_layout:
                 self._validate_canonical_refs(kv_caches)
-            return CPUOffloadingWorker(
+            return worker_cls(
                 kv_caches=kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_chunks=self.num_chunks,

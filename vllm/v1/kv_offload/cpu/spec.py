@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
 from typing import Any
 
 from typing_extensions import override
 
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
@@ -41,6 +43,15 @@ def _all_workers_barrier() -> None:
     except AssertionError:
         group = get_world_group()
     group.barrier()
+
+
+def offloading_worker_cls() -> Callable[..., OffloadingWorker]:
+    """The CPU-tier worker class: the platform's if it supplies one, else the
+    built-in one."""
+    qualname = current_platform.get_offloading_worker_cls()
+    if qualname is not None:
+        return resolve_obj_by_qualname(qualname)
+    return CPUOffloadingWorker
 
 
 class CPUOffloadingSpec(OffloadingSpec):
@@ -136,7 +147,7 @@ class CPUOffloadingSpec(OffloadingSpec):
         self._manager: OffloadingManager | None = None
 
         # worker-side
-        self._worker: CPUOffloadingWorker | None = None
+        self._worker: OffloadingWorker | None = None
 
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
         self.cache_policy_module_path: str | None = self.extra_config.get(
@@ -179,7 +190,8 @@ class CPUOffloadingSpec(OffloadingSpec):
             current_platform.is_cuda_alike() and not current_platform.is_rocm()
         ) or current_platform.is_xpu()
 
-    def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
+    def create_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        worker_cls = offloading_worker_cls()
         mmap_region: SharedOffloadRegion | None = None
         # num_chunks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
@@ -202,7 +214,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 ),
             )
         try:
-            return CPUOffloadingWorker(
+            return worker_cls(
                 kv_caches=kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_chunks=self.num_chunks,
@@ -216,10 +228,13 @@ class CPUOffloadingSpec(OffloadingSpec):
     @override
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         if not self._worker:
-            if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
+            if current_platform.get_offloading_worker_cls() is None and not (
+                current_platform.is_cuda_alike() or current_platform.is_xpu()
+            ):
                 raise Exception(
                     "CPU Offloading is currently only supported on CUDA-alike "
-                    "and XPU GPUs"
+                    "and XPU GPUs, and on platforms that supply an offloading "
+                    "worker (Platform.get_offloading_worker_cls)"
                 )
             self._worker = self.create_worker(kv_caches)
 
