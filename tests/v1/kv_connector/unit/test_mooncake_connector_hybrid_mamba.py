@@ -242,6 +242,7 @@ async def test_build_transfer_params_uses_non_overlapping_physical_pages():
     kv_cache_config = make_hybrid_gdn_kv_cache_config(block_size=16)
     worker = object.__new__(MooncakeConnectorWorker)
     worker.shutdown = noop_shutdown
+    worker.use_host_buffer = False  # set in __init__, which __new__ skips
     worker.use_mla = False
     worker.engine = SimpleNamespace(batch_register_memory=lambda *_: 0)
     worker.is_kv_consumer = True
@@ -550,6 +551,7 @@ def test_hybrid_gdn_transfer_params_preserve_group_identity(monkeypatch):
 def test_logical_to_kernel_block_ids_expands_fa_not_gdn():
     worker = object.__new__(MooncakeConnectorWorker)
     worker.shutdown = noop_shutdown
+    worker.use_host_buffer = False  # set in __init__, which __new__ skips
     worker._physical_blocks_per_logical_kv_block = 17
     worker.kv_cache_config = make_hybrid_gdn_kv_cache_config(block_size=544)
 
