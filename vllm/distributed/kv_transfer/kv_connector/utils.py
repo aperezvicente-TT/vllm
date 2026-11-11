@@ -231,6 +231,10 @@ def copy_kv_blocks(
         copy_fn(src_tensor, dst_tensor, src_indices, dst_indices)
 
 
+# Each call completes before returning (see `CopyBlocksOp`).
+copy_kv_blocks.synchronous = True  # type: ignore[attr-defined]
+
+
 def allocate_host_mirrors(
     kv_caches: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:

@@ -69,10 +69,13 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 # s_tensor_list, d_tensor_list, s_indices, d_indices, direction.
-# A synchronous op returns None once the copy is done. An asynchronous op
-# returns a handle whose ``done()`` reports completion (and raises if the copy
-# failed); the caller decides when it needs the copy, so such an op must order
-# the copy after the work already queued on the device.
+# A synchronous op returns None once the copy is done, and says so with a
+# ``synchronous = True`` attribute. An asynchronous op returns a handle whose
+# ``done()`` reports completion (and raises if the copy failed); the caller
+# decides when it needs the copy, so such an op must order the copy after the
+# work already queued on the device. A call that returns None from an op not
+# declared synchronous gives no completion to rely on: NIXL push does not WRITE
+# those blocks early.
 CopyBlocksOp = Callable[
     [
         dict[str, torch.Tensor],
