@@ -405,6 +405,7 @@ async def test_build_transfer_params_uses_non_overlapping_physical_pages(block_o
     kv_cache_config = make_hybrid_gdn_kv_cache_config(block_size=16)
     worker = object.__new__(MooncakeConnectorWorker)
     worker.shutdown = noop_shutdown
+    worker.use_host_buffer = False  # set in __init__, which __new__ skips
     # __new__ skips __init__, where these caches are created.
     worker._prepared_transfer_regions = {}
     worker._layout_by_peer = OrderedDict()
@@ -726,6 +727,7 @@ def test_hybrid_gdn_transfer_params_preserve_group_identity(monkeypatch):
 def test_logical_to_kernel_block_ids_expands_fa_not_gdn():
     worker = object.__new__(MooncakeConnectorWorker)
     worker.shutdown = noop_shutdown
+    worker.use_host_buffer = False  # set in __init__, which __new__ skips
     worker._physical_blocks_per_logical_kv_block = 17
     worker.kv_cache_config = make_hybrid_gdn_kv_cache_config(block_size=544)
 
